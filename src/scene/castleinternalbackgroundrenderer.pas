@@ -56,6 +56,10 @@ type
       to avoid any artifacts. }
     class function NearFarToSkySphereRadius(const zNear, zFar: Single): Single;
   public
+    { Detached background graph, for CPU texture preparation before publication. }
+    function InternalRootNode:TX3DRootNode;virtual;
+    { Main-thread incremental texture upload, before displaying the background. }
+    function PrepareTexturesStep(var Index:Integer):Boolean;virtual;
     procedure Render(const RenderingCamera: TRenderingCamera;
       const Wireframe: boolean;
       const RenderRect: TFloatRectangle;
@@ -77,7 +81,7 @@ function CreateBackgroundRenderer(const Node: TAbstractBackgroundNode): TBackgro
 implementation
 
 uses Math,
-  CastleLog, CastleScene, X3DFields, CastleSceneCore, CastleGLImages,
+  CastleLog, CastleScene, X3DFields, CastleSceneCore, CastleGLImages, CastleShapes, CastleSceneInternalShape,
   CastleRenderContext, CastleRenderOptions, CastleInternalGLUtils;
 
 const
@@ -120,6 +124,12 @@ begin
   Result := (Min + Max) / 2;
 end;
 
+function TBackgroundRenderer.PrepareTexturesStep(var Index:Integer):Boolean;
+begin Result:=True;end;
+
+function TBackgroundRenderer.InternalRootNode:TX3DRootNode;
+begin Result:=nil;end;
+
 procedure TBackgroundRenderer.Render(const RenderingCamera: TRenderingCamera;
   const Wireframe: boolean;
   const RenderRect: TFloatRectangle;
@@ -157,6 +167,8 @@ type
   public
     constructor Create;
     destructor Destroy; override;
+    function InternalRootNode:TX3DRootNode;override;
+    function PrepareTexturesStep(var Index:Integer):Boolean;override;
     procedure Render(const RenderingCamera: TRenderingCamera;
       const Wireframe: boolean;
       const RenderRect: TFloatRectangle;
@@ -166,6 +178,19 @@ type
     procedure FreeResources; override;
     procedure Update(const SecondsPassed: Single); override;
   end;
+
+function TBackgroundScene.PrepareTexturesStep(var Index:Integer):Boolean;
+var Shapes:TShapeList;
+begin
+  Shapes:=Scene.Shapes.TraverseList(False,False);
+  if (Index>=0) and (Index<Shapes.Count) then begin
+    TGLShape(Shapes[Index]).PrepareResources;Inc(Index);
+  end;
+  Result:=Index>=Shapes.Count;
+end;
+
+function TBackgroundScene.InternalRootNode:TX3DRootNode;
+begin Result:=Scene.RootNode;end;
 
 constructor TBackgroundScene.Create;
 begin
@@ -406,6 +431,7 @@ var
     Color: TColorNode;
     Geometry: TIndexedFaceSetNode;
     Shape: TShapeNode;
+    Appearance: TAppearanceNode;
   begin
     { add a mesh for sphere, if not present already }
     if not SphereCreated then
@@ -426,6 +452,12 @@ var
 
       Shape := TShapeNode.Create('', Node.BaseUrl);
       Shape.FdGeometry.Value := Geometry;
+      { Background effects apply to the colour hemisphere as well as the
+        optional texture cube (e.g. a sun aligned with the scene lighting). }
+      Appearance := TAppearanceNode.Create('', Node.BaseUrl);
+      Appearance.FdShaders.AssignValue(Node.FdShaders);
+      Appearance.FdEffects.AssignValue(Node.FdEffects);
+      Shape.Appearance := Appearance;
 
       Transform.AddChildren(Shape);
     end;

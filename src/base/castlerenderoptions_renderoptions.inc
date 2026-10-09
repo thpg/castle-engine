@@ -24,6 +24,12 @@ type
   { Options that control rendering,
     available at every scene through @link(TCastleScene.RenderOptions). }
   TCastleRenderOptions = class(TCastleComponent)
+  public
+    { Opt-in revision of object-space cached vertex deformation. Zero retains
+      per-frame behaviour. Increment after changing animation uniforms; world
+      transforms and camera changes do not invalidate an object-space pose.
+      Not part of the material hash: this never rebuilds shaders. }
+    CachedAnimationRevision: QWord;
   strict private
     type
       TRenderOptionsHash = Int32;

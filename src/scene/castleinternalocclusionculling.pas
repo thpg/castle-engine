@@ -53,10 +53,15 @@ type
   TOcclusionCullingRenderer = class
   strict private
     FUtils: TOcclusionCullingUtilsRenderer;
+    FViewValid: Boolean;
+    FPreviousPosition, FPreviousDirection, FPreviousUp: TVector3;
+    FPreviousProjection: TMatrix4;
+    FVisibleFrame: Int64;
   public
     constructor Create;
     destructor Destroy; override;
     property Utils: TOcclusionCullingUtilsRenderer read FUtils;
+    procedure BeginView(const Params: TRenderParams);
     procedure Render(const CollectedShape: TCollectedShape;
       const Params: TRenderParams; const PassParams: TRenderOnePassParams;
       const RenderShape: TShapeRenderEvent);
@@ -188,6 +193,29 @@ begin
   inherited;
 end;
 
+procedure TOcclusionCullingRenderer.BeginView(const Params: TRenderParams);
+var
+  Pos, Dir, Up, Delta: TVector3;
+begin
+  Pos := Params.RenderingCamera.View.Translation;
+  Dir := Params.RenderingCamera.View.Direction;
+  Up := Params.RenderingCamera.View.Up;
+  Delta := Pos - FPreviousPosition;
+  { A query describes the preceding camera. On teleport, sharp turn or
+    projection change render conservatively for one frame and refresh queries.
+    Keep this state per viewport; shadow passes must not change it. }
+  if (not FViewValid) or (Delta.Length > 1.0) or
+     (TVector3.DotProduct(Dir, FPreviousDirection) < 0.9961947) or
+     (TVector3.DotProduct(Up, FPreviousUp) < 0.9961947) or
+     (not CompareMem(@FPreviousProjection, @Utils.ProjectionMatrix, SizeOf(TMatrix4))) then
+    FVisibleFrame := TFramesPerSecond.RenderFrameId;
+  FViewValid := True;
+  FPreviousPosition := Pos;
+  FPreviousDirection := Dir;
+  FPreviousUp := Up;
+  FPreviousProjection := Utils.ProjectionMatrix;
+end;
+
 procedure TOcclusionCullingRenderer.Render(const CollectedShape: TCollectedShape;
   const Params: TRenderParams; const PassParams: TRenderOnePassParams;
   const RenderShape: TShapeRenderEvent);
@@ -280,6 +308,9 @@ begin
     WasVisible := true; // assume is visible
     QueryResultAvailable := true; // allow issuing a new query below
   end;
+
+  if (FVisibleFrame = TFramesPerSecond.RenderFrameId) or SceneMultipleInstances then
+    WasVisible := True;
 
   { Render shape, or shape box, possibly making new occlusion query. }
   OcclusionQueryAsk :=

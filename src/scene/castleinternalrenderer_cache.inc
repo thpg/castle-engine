@@ -62,6 +62,7 @@
       reason.) }
     function TextureImage_IncReference(
       TextureImage: TEncodedImage;
+      const SourceAlpha: TAlphaChannel;
       const TextureFullUrl: String;
       Filter: TTextureFilter;
       const TextureAnisotropy: TGLfloat;
@@ -69,6 +70,12 @@
       const CompositeForMipmaps: TCompositeImage;
       const GUITexture: boolean;
       const FlipVertically: Boolean): TGLTexture;
+
+    function TextureImage_Find(const TextureFullUrl: String;
+      const Filter: TTextureFilter; const TextureAnisotropy: TGLfloat;
+      const TextureWrap: TTextureWrap2D; const GUITexture, FlipVertically: Boolean): TTextureImageCache;
+    function TextureImage_HasUrl(const TextureFullUrl: String;
+      const FlipVertically: Boolean): Boolean;
 
     procedure TextureImage_DecReference(
       const TextureGLName: TGLTexture);
@@ -262,8 +269,39 @@ begin
   inherited;
 end;
 
+function TRendererCache.TextureImage_HasUrl(const TextureFullUrl: String;
+  const FlipVertically: Boolean): Boolean;
+var I: Integer;
+begin
+  Result := False;
+  if TextureFullUrl = '' then Exit;
+  for I := 0 to TextureImageCaches.Count - 1 do
+    if (TextureImageCaches[I].FullUrl = TextureFullUrl) and
+       (TextureImageCaches[I].FlipVertically = FlipVertically) then Exit(True);
+end;
+
+function TRendererCache.TextureImage_Find(const TextureFullUrl: String;
+  const Filter: TTextureFilter; const TextureAnisotropy: TGLfloat;
+  const TextureWrap: TTextureWrap2D; const GUITexture, FlipVertically: Boolean): TTextureImageCache;
+var I: Integer; Cached: TTextureImageCache;
+begin
+  Result := nil;
+  if TextureFullUrl = '' then Exit;
+  for I := 0 to TextureImageCaches.Count - 1 do
+  begin
+    Cached := TextureImageCaches[I];
+    if (Cached.FullUrl = TextureFullUrl) and
+       (Cached.FlipVertically = FlipVertically) and
+       (Cached.Filter = Filter) and
+       (Cached.Anisotropy = TextureAnisotropy) and
+       (Cached.Wrap = TextureWrap) and
+       (Cached.GUITexture = GUITexture) then Exit(Cached);
+  end;
+end;
+
 function TRendererCache.TextureImage_IncReference(
   TextureImage: TEncodedImage;
+  const SourceAlpha: TAlphaChannel;
   const TextureFullUrl: String;
   Filter: TTextureFilter;
   const TextureAnisotropy: TGLfloat;
@@ -282,13 +320,14 @@ function TRendererCache.TextureImage_IncReference(
   end;
 
 var
-  I: Integer;
   TextureCached: TTextureImageCache;
   FreeTextureImage: Boolean;
+  SourceWidth, SourceHeight: Cardinal;
 begin
-  for I := 0 to TextureImageCaches.Count - 1 do
+  TextureCached := TextureImage_Find(TextureFullUrl, Filter, TextureAnisotropy,
+    TextureWrap, GUITexture, FlipVertically);
+  if TextureCached <> nil then
   begin
-    TextureCached := TextureImageCaches[I];
 
     { Once I had an idea to make here comparison with
       TextureImage = TextureCached^.Image. Since we have TTexturesVideosCache,
@@ -311,22 +350,15 @@ begin
 
       For now, I don't use this idea, and rely on TextureFullUrl. }
 
-    if (TextureFullUrl <> '') and
-       (TextureCached.FullUrl = TextureFullUrl) and
-       (TextureCached.FlipVertically = FlipVertically) and
-       (TextureCached.Filter = Filter) and
-       (TextureCached.Anisotropy = TextureAnisotropy) and
-       (TextureCached.Wrap = TextureWrap) and
-       (TextureCached.GUITexture = GUITexture) then
-    begin
-      Inc(TextureCached.References);
-      if LogRendererCache then
-        WritelnLog('++', 'TextureImage %s: %d', [TextureFullUrl, TextureCached.References]);
-      Exit(TextureCached.GLName);
-    end;
+    Inc(TextureCached.References);
+    if LogRendererCache then
+      WritelnLog('++', 'TextureImage %s: %d', [TextureFullUrl, TextureCached.References]);
+    Exit(TextureCached.GLName);
   end;
 
   FreeTextureImage := false;
+  SourceWidth := TextureImage.Width;
+  SourceHeight := TextureImage.Height;
 
   if IsFloatImage(TextureImage) then
   begin
@@ -384,6 +416,9 @@ begin
   TextureCached.GUITexture := GUITexture;
   TextureCached.References := 1;
   TextureCached.GLName := Result;
+  TextureCached.SourceWidth := SourceWidth;
+  TextureCached.SourceHeight := SourceHeight;
+  TextureCached.SourceAlpha := SourceAlpha;
 
   if LogRendererCache then
     WritelnLog('++', 'TextureImage %s: %d', [TextureFullUrl, 1]);
@@ -920,26 +955,59 @@ begin
   Caches := ShapeCaches[DisableSharedCache];
 
   if not DisableSharedCache then
-    for I := 0 to Caches.Count - 1 do
+  begin
+    I := 0;
+    while I <= Caches.Count - 1 do
     begin
       Result := Caches[I];
-      if (Result.Geometry = Shape.Geometry) and
-         Result.RenderOptions.EqualForShapeCache(RenderOptions) and
-         Result.State.Equals(Shape.State, IgnoreStateTransform) and
-         FogVolumetricEqual(
-           Result.FogVolumetric,
-           Result.FogVolumetricDirection,
-           Result.FogVolumetricVisibilityStart,
-           FogVolumetric,
-           FogVolumetricDirection,
-           FogVolumetricVisibilityStart) then
-      begin
-        Inc(Result.References);
-        if LogRendererCache then
-          WritelnLog('++', Result.ToString);
-        Exit(Result);
+      { Vatokat-DIAG: раньше здесь был AV (GetNode через State.Equals),
+        когда запись кэша ссылалась на state/geometry уже освобождённой
+        сцены (гонка при teardown'е). Вместо падения — лог и выброс
+        зомби-записи (объект намеренно не Free — им может владеть
+        рендер; leak безопаснее AV). }
+      try
+        { REZVIVO: skip entries already marked poison, or with missing State
+          (mid-teardown). Avoid State.Equals on dangling VRML1State. }
+        if (Result.Geometry = nil) or (Result.State = nil) or (Shape.State = nil) then
+        begin
+          if Result.Geometry <> nil then
+            Result.Geometry := nil;
+          Inc(I);
+          Continue;
+        end;
+        if (Result.Geometry = Shape.Geometry) and
+           Result.RenderOptions.EqualForShapeCache(RenderOptions) and
+           Result.State.Equals(Shape.State, IgnoreStateTransform) and
+           FogVolumetricEqual(
+             Result.FogVolumetric,
+             Result.FogVolumetricDirection,
+             Result.FogVolumetricVisibilityStart,
+             FogVolumetric,
+             FogVolumetricDirection,
+             FogVolumetricVisibilityStart) then
+        begin
+          Inc(Result.References);
+          if LogRendererCache then
+            WritelnLog('++', Result.ToString);
+          Exit(Result);
+        end;
+        Inc(I);
+      except
+        on E: Exception do
+        begin
+          WritelnLog('RendererCache', Format(
+            'Shape_InCreference: poisoned dangling cache entry %d/%d (%s: %s)',
+            [I, Caches.Count, E.ClassName, E.Message]));
+          { REZVIVO/Vatokat-DIAG: запись остаётся в списке (её найдёт
+            Shape_DecReference по IndexOf), но Geometry := nil гасит
+            совпадение — State.Equals с висячим указателем больше
+            не вызывается. }
+          Result.Geometry := nil;
+          Inc(I);
+        end;
       end;
     end;
+  end;
 
   { not found, so create new }
 
@@ -986,6 +1054,7 @@ function TRendererCache.Program_IncReference(
   Shader: TShader; const ShapeNiceName: string): TShaderProgramCache;
 var
   I: Integer;
+  PrepareTick, PrepareMs: QWord;
 begin
   for I := 0 to ProgramCaches.Count - 1 do
   begin
@@ -1004,6 +1073,9 @@ begin
   Result.References := 1;
   Result.Hash := Shader.CodeHash;
 
+  { REZVIVO: the fast shared-program cache hit above does not read a timer.
+    This includes shader composition and optional program-binary disk load. }
+  PrepareTick := GetTickCount64;
   try
     Result.ShaderProgram := TX3DGLSLProgram.Create;
     Shader.LinkProgram(Result.ShaderProgram, ShapeNiceName);
@@ -1037,6 +1109,11 @@ begin
       end;
     end;
   end;
+
+  PrepareMs := GetTickCount64 - PrepareTick;
+  if PrepareMs > 100 then
+    WritelnLog('ResourcePrepare', 'stage=shader_build_or_binary ms=%d shape="%s" hash=%s',
+      [PrepareMs, ShapeNiceName, Result.Hash.ToString]);
 
   if LogRendererCache then
     WritelnLog('++', 'Shader program (hash %s): %d', [Result.Hash.ToString, Result.References]);

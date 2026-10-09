@@ -593,8 +593,21 @@ begin
   if Status = dsDownloading then
   begin
     Assert(Reader <> nil);
+    if Reader = nil then Exit;
 
-    Reader.Update;
+    try
+      Reader.Update;
+    except
+       on E: TObject do begin
+         sleep(10);
+         try
+           Reader.Update;
+         except
+           on E: TObject do begin
+           end;
+         end;
+       end;
+    end;
 
     Assert(Reader.Status <> dsNotStarted);
     FStatus := Reader.Status;

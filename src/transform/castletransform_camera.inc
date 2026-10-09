@@ -254,6 +254,7 @@
   strict private
     FGravityUp: TVector3;
     FProjectionMatrix: TMatrix4;
+    FEffectiveViewportHeight: Single;
     FProjectionNear, FProjectionFar: Single;
     FEffectiveProjectionNear, FEffectiveProjectionFar: Single;
     FProjectionType: TProjectionType;
@@ -357,6 +358,9 @@
       this is automatically correctly set for you. }
     property ProjectionMatrix: TMatrix4
       read FProjectionMatrix write SetProjectionMatrix;
+    { Last viewport height used to calculate projection, in render pixels.
+      Useful for stable projected-size LOD independent of the current GL pass. }
+    property EffectiveViewportHeight: Single read FEffectiveViewportHeight;
 
     { Calculate a ray picked by WindowPosition position on the viewport,
       assuming current viewport dimensions are as given.
@@ -1365,6 +1369,7 @@ var
 
 begin
   Result.ProjectionType := ProjectionType;
+  FEffectiveViewportHeight := ViewportHeight;
 
   Result.PerspectiveAnglesRad := TViewpointNode.InternalFieldOfView(
     Perspective.FieldOfView,

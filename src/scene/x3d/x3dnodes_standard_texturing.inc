@@ -334,6 +334,12 @@
     }
     property TextureUsedFullUrl: String read FTextureUsedFullUrl;
 
+    { Renderer-only metadata. Does not pretend that CPU image pixels are
+      loaded: TextureImage still loads them on explicit demand. }
+    property InternalTextureAlpha: TAlphaChannel read FAlphaChannelData;
+    procedure InternalUseCachedTextureMetadata(const FullUrl: String;
+      const Alpha: TAlphaChannel);
+
   {$I auto_generated_node_helpers/x3dnodes_x3dtexture2dnode.inc}
   end;
 
@@ -914,6 +920,14 @@ end;
 function TAbstractTexture2DNode.AlphaChannelData: TAlphaChannel;
 begin
   Result := FAlphaChannelData;
+end;
+
+procedure TAbstractTexture2DNode.InternalUseCachedTextureMetadata(
+  const FullUrl: String; const Alpha: TAlphaChannel);
+begin
+  Assert(not IsTextureLoaded);
+  FTextureUsedFullUrl := FullUrl;
+  FAlphaChannelData := Alpha;
 end;
 
 { TImageTextureNode ---------------------------------------------------------- }

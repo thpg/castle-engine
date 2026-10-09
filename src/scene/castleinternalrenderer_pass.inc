@@ -28,7 +28,7 @@
   TTotalRenderingPass = 0..
     (High(TInternalRenderingPass) + 1) *
     (High(TWireframeRenderingPass) + 1) *
-    (High(TUserRenderingPass) + 1)
+    (High(TUserRenderingPass) + 1) * 2 { separate colour / shadow programs }
     - 1;
 
 {$endif read_interface}

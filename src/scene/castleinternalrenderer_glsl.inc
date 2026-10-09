@@ -116,6 +116,13 @@ begin
     else
       UniformsTextures.Delete(I);
   end;
+  try
+    for I := 0 to SharedUniformsTextures.Count - 1 do
+      BindTextureUniform(SharedUniformsTextures[I]);
+  finally
+    { These fields belong to the current draw only, not to this program. }
+    SharedUniformsTextures.Clear;
+  end;
 end;
 
 {$endif read_implementation}

@@ -174,7 +174,8 @@ uses Classes, SysUtils, Generics.Collections,
   CastleGLShaders, CastleGLImages, CastleTextureImages, CastleVideos, X3DTime,
   CastleShapes, CastleClassUtils, CastleInternalCompositeImage,
   CastleInternalGeometryArrays, CastleInternalArraysGenerator, CastleRendererInternalShader,
-  CastleRendererInternalTextureEnv, CastleBoxes, CastleTransform, CastleRenderOptions;
+  CastleRendererInternalTextureEnv, CastleBoxes, CastleTransform, CastleRenderOptions,
+  CastleInternalShadowMaps;
 
 {$define read_interface}
 

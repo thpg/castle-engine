@@ -115,6 +115,7 @@ type
       FDepthRange: TDepthRange;
       FCullFace, FFrontFaceCcw: boolean;
       FDepthTest: Boolean;
+      FSampleAlphaToCoverage: Boolean;
       FDepthFunc: TDepthFunction;
       FColorChannels: TColorChannels;
       FDepthBufferUpdate: Boolean;
@@ -142,6 +143,7 @@ type
     procedure SetCullFace(const Value: boolean);
     procedure SetFrontFaceCcw(const Value: boolean);
     procedure SetDepthTest(const Value: Boolean);
+    procedure SetSampleAlphaToCoverage(const Value: Boolean);
     procedure SetDepthFunc(const Value: TDepthFunction);
     function GetColorMask: boolean;
     procedure SetColorMask(const Value: boolean);
@@ -231,6 +233,10 @@ type
 
     { Depth testing means we reject things that don't pass @link(DepthFunc). }
     property DepthTest: Boolean read FDepthTest write SetDepthTest default false;
+    { Use this state cache instead of querying GL per alpha-masked shape.
+      A glIsEnabled query can drain the driver's threaded command queue. }
+    property SampleAlphaToCoverage: Boolean read FSampleAlphaToCoverage
+      write SetSampleAlphaToCoverage default false;
 
     { Function to use when comparing depth, only if @link(DepthTest). }
     property DepthFunc: TDepthFunction read FDepthFunc write SetDepthFunc default dfLess;
@@ -609,6 +615,15 @@ begin
   begin
     FDepthTest := Value;
     GLSetEnabled(GL_DEPTH_TEST, FDepthTest);
+  end;
+end;
+
+procedure TRenderContext.SetSampleAlphaToCoverage(const Value: Boolean);
+begin
+  if FSampleAlphaToCoverage <> Value then
+  begin
+    FSampleAlphaToCoverage := Value;
+    GLSetEnabled(GL_SAMPLE_ALPHA_TO_COVERAGE, Value);
   end;
 end;
 

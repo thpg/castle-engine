@@ -741,6 +741,8 @@ begin
   if ParentNode <> nil then
   begin
     Parent := ParentNode as TX3DNode;
+    if Parent is TEffectNode then
+      TEffectNode(Parent).InternalSharedValuesChanged;
     if Parent.Scene <> nil then
       Parent.Scene.InternalChangedField(Self);
   end;

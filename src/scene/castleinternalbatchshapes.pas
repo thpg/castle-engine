@@ -292,6 +292,18 @@ function TBatchShapes.Batch(const CollectedShape: TCollectedShape): Boolean;
     if Shape.Node = nil then
       Exit;
 
+    { Vatokat PATCH (lost-wheels): shapes with X3D effects must not be
+      batched. The batch merges geometry from multiple shapes into one pool
+      mesh; a vertex effect (e.g. GPU-вращение колёс байка в Vatokat)
+      then applies to the merged, already-transformed coordinates instead
+      of the shape's own object space — the affected shapes turn into
+      garbage / become invisible. Note AppearancesMatch (used to find
+      mergeable pairs) does not compare FdEffects, so effect-bearing
+      shapes could otherwise be merged. }
+    if (Shape.State.Appearance <> nil) and
+       (Shape.State.Appearance.FdEffects.Count <> 0) then
+      Exit;
+
     // We can only merge TAbstractComposedGeometryNode for now
     Geometry := Shape.Geometry;
     if not (Geometry is TAbstractComposedGeometryNode) then

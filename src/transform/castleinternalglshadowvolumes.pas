@@ -164,7 +164,7 @@ type
 
 implementation
 
-uses SysUtils,
+uses SysUtils, Classes,
   CastleStringUtils, CastleLog, CastleGLVersion,
   CastleTriangles, CastleRenderOptions, CastleRenderContext;
 
@@ -491,6 +491,45 @@ begin
   end;
 end;
 
+{ PATCH-DIAG (Vatokat): накопление длительности shadow-volume прохода. }
+var
+  GSVDiagCount: Integer = 0;
+  GSVDiagTicks: QWord = 0;
+  GSVOpaque1: QWord; GSVOpaque2: QWord; GSVStencil1: QWord; GSVOpaque3: QWord;
+  GSVPrepass: QWord; GSVStencil2: QWord; GSVTransp: QWord;
+
+procedure SVDiagAdd(var Acc: QWord; var T0: QWord);
+var
+  T2: QWord;
+begin
+  T2 := GetTickCount64;
+  Acc := Acc + (T2 - T0);
+  T0 := T2;
+end;
+
+procedure SVDiagLog(const S: string);
+var
+  FS: TFileStream;
+  Line: RawByteString;
+  Path: string;
+begin
+  try
+    Path := 'sv_diag.log';
+    if FileExists(Path) then
+      FS := TFileStream.Create(Path, fmOpenReadWrite or fmShareDenyNone)
+    else
+      FS := TFileStream.Create(Path, fmCreate or fmShareDenyNone);
+    try
+      FS.Seek(0, soEnd);
+      Line := RawByteString(FormatDateTime('hh:nn:ss.zzz', Now) + ' ' + S + LineEnding);
+      FS.WriteBuffer(Line[1], Length(Line));
+    finally
+      FS.Free;
+    end;
+  except
+  end;
+end;
+
 procedure TGLShadowVolumeRenderer.Render(
   const Params: TRenderParams;
   const RenderOnePass: TSVRenderOnePassProc;
@@ -523,7 +562,10 @@ var
   SavedDepthFunc: TDepthFunction;
   SavedCullFace, SavedDepthTest: Boolean;
   PassParams: TRenderOnePassParams;
+  SVT0: QWord;
 begin
+  { PATCH-DIAG (Vatokat): время всего shadow-volume прохода -> sv_diag.log }
+  SVT0 := GetTickCount64;
   Assert(GLFeatures.ShadowVolumesPossible);
 
   // render opaque stuff that is never in shadow, because it does not receive shadows
@@ -532,6 +574,7 @@ begin
   PassParams.DisableShadowVolumeCastingLights := false;
   PassParams.FilterShadowVolumesReceivers := [false];
   RenderOnePass(Params, PassParams);
+  SVDiagAdd(GSVOpaque1, SVT0);
 
   // render opaque stuff, assuming it is in shadow (but it does receive shadows, may be overdrawn later with lit version)
   PassParams.Init;
@@ -539,6 +582,7 @@ begin
   PassParams.DisableShadowVolumeCastingLights := true;
   PassParams.FilterShadowVolumesReceivers := [true];
   RenderOnePass(Params, PassParams);
+  SVDiagAdd(GSVOpaque2, SVT0);
 
   glEnable(GL_STENCIL_TEST);
     { Note that stencil buffer is set to all 0 now. }
@@ -556,6 +600,7 @@ begin
 
       glStencilFunc(GL_ALWAYS, 0, 0);
       RenderShadowVolumes(Params);
+      SVDiagAdd(GSVStencil1, SVT0);
 
     RenderContext.DepthBufferUpdate := SavedDepthBufferUpdate;
     RenderContext.ColorChannels := SavedColorChannels;
@@ -641,6 +686,7 @@ begin
       PassParams.DisableShadowVolumeCastingLights := false;
       PassParams.InsideStencilTest := true;
       RenderOnePass(Params, PassParams);
+      SVDiagAdd(GSVOpaque3, SVT0);
 
     glDisable(GL_STENCIL_TEST);
 
@@ -667,12 +713,144 @@ begin
     Count := SavedCount;
   end;
 
-  // render all transparent stuff, never in shadow
+  // render all transparent stuff
+  //
+  // PATCH (Vatokat): the upstream engine renders ALL transparent shapes once,
+  // with FilterShadowVolumesReceivers = [false, true] and NO stencil test, so
+  // shadow volumes never darken a transparent receiver (the long comment above
+  // explains this was a deliberate cost-saving simplification, not a hardware
+  // limit). We split it so transparent RECEIVERS respect the shadow stencil:
+  // they are drawn DARK (shadow-casting lights off) where stencil <> 0
+  // (inside shadow) and LIT where stencil = 0 (outside shadow).
+  //
+  // Dedicated shadow catchers (TCastleScene.ShadowCatcher) are special.
+  // The z-fail counting above only registers a shadow where some surface
+  // depth makes the volume's far side fail the depth test. Transparent
+  // shapes never write depth, so with nothing opaque behind the volume
+  // (a floating semi-transparent catcher over a ground that writes no
+  // depth) the counts cancel to zero and the catcher would stay shadowless.
+  // Hence, for catchers only:
+  //  1) a depth-only prepass below gives the catcher's surface a
+  //     depth-buffer presence (PassParams.OnlyDepth masks color writes,
+  //     ForceDepthBufferUpdate defeats the blending no-depth-write rule).
+  //     It runs AFTER the opaque lit pass, so opaque receivers behind the
+  //     catcher are NOT darkened by its depth (no artifacts on the floor).
+  //  2) the volume counting is then REPEATED (stencil cleared) so the
+  //     stencil below reflects the catcher's own surface, and the catcher
+  //     is drawn ONLY in the dark pass — with an unlit black catcher
+  //     material that yields the classic catcher look: invisible outside
+  //     the shadow, a translucent dark veil (terrain showing through)
+  //     inside it.
+  // The depth prepass is deliberately restricted to shapes flagged
+  // ShadowCatcher: forcing depth writes on ALL transparent shapes would
+  // corrupt their blending (they would start occluding other transparent
+  // objects, i.e. effectively become opaque).
+
+  { 1) shadow-catcher depth-only prepass + repeated volume counting
+       (see the PATCH comment above) }
+  PassParams.Init;
+  PassParams.UsingBlending := true;
+  PassParams.DisableShadowVolumeCastingLights := true;
+  PassParams.FilterShadowVolumesReceivers := [true];
+  PassParams.ForceDepthBufferUpdate := true;
+  PassParams.OnlyShadowCatchers := true;
+  PassParams.OnlyDepth := true;
+  RenderOnePass(Params, PassParams);
+  SVDiagAdd(GSVPrepass, SVT0);
+
+  glEnable(GL_STENCIL_TEST);
+    SavedCullFace := RenderContext.CullFace;
+    SavedDepthTest := RenderContext.DepthTest;
+    SavedDepthBufferUpdate := RenderContext.DepthBufferUpdate;
+    SavedColorChannels := RenderContext.ColorChannels;
+
+    RenderContext.DepthTest := true;
+    RenderContext.DepthBufferUpdate := false;
+    RenderContext.ColorChannels := [];
+
+      glClear(GL_STENCIL_BUFFER_BIT);
+      glStencilFunc(GL_ALWAYS, 0, 0);
+      { the opaque lit pass above forced glStencilOp to KEEP/KEEP/KEEP, and
+        the stencil-configuration cache would otherwise skip re-applying the
+        INCR/DECR setup for this second counting }
+      StencilConfigurationKnown := false;
+      RenderShadowVolumes(Params);
+      SVDiagAdd(GSVStencil2, SVT0);
+
+    RenderContext.DepthBufferUpdate := SavedDepthBufferUpdate;
+    RenderContext.ColorChannels := SavedColorChannels;
+    RenderContext.CullFace := SavedCullFace;
+    RenderContext.DepthTest := SavedDepthTest;
+  glDisable(GL_STENCIL_TEST);
+
+  { 2) transparent NON-receivers: unchanged — always lit, no stencil }
   PassParams.Init;
   PassParams.UsingBlending := true;
   PassParams.DisableShadowVolumeCastingLights := false;
-  PassParams.FilterShadowVolumesReceivers := [false, true];
+  PassParams.FilterShadowVolumesReceivers := [false];
   RenderOnePass(Params, PassParams);
+  SVDiagAdd(GSVTransp, SVT0);
+
+  RenderContext.DepthFunc := dfLessEqual;
+  glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+
+  { 3) transparent RECEIVERS in shadow (stencil <> 0): draw DARK, with the
+       shadow-volume-casting lights turned off — the same "shadowed pass"
+       opaque receivers get above. Without this pass the shadowed part of a
+       transparent receiver was not drawn AT ALL, so a semi-transparent
+       shadow catcher stayed see-through (read: shadowless) exactly where
+       the shadow should fall. Now it blends its dark color over the ground. }
+  glStencilFunc(GL_NOTEQUAL, 0, StencilShadowBits);
+  glEnable(GL_STENCIL_TEST);
+    PassParams.Init;
+    PassParams.UsingBlending := true;
+    PassParams.FilterShadowVolumesReceivers := [true];
+    PassParams.DisableShadowVolumeCastingLights := true;
+    PassParams.InsideStencilTest := true;
+    RenderOnePass(Params, PassParams);
+    SVDiagAdd(GSVTransp, SVT0);
+  glDisable(GL_STENCIL_TEST);
+
+  { 4) transparent RECEIVERS outside shadow (stencil = 0): draw LIT.
+       Dedicated shadow catchers (TCastleScene.ShadowCatcher) are EXCLUDED
+       here: a catcher is drawn only in pass (3), so outside the shadow it
+       stays fully invisible and the ground shows through untouched (with an
+       unlit black catcher material the result is the classic behaviour —
+       clean terrain outside the shadow, a translucent dark veil inside it,
+       the terrain visible through the shadow).
+       For all other (non-catcher) receivers, passes (3)+(4) together cover
+       the shape exactly once: dark inside shadow, lit outside — like the
+       opaque double-pass. }
+  glStencilFunc(GL_EQUAL, 0, StencilShadowBits);
+  glEnable(GL_STENCIL_TEST);
+    PassParams.Init;
+    PassParams.UsingBlending := true;
+    PassParams.FilterShadowVolumesReceivers := [true];
+    PassParams.DisableShadowVolumeCastingLights := false;
+    PassParams.InsideStencilTest := true;
+    PassParams.ExcludeShadowCatchers := true;
+    RenderOnePass(Params, PassParams);
+    SVDiagAdd(GSVTransp, SVT0);
+  glDisable(GL_STENCIL_TEST);
+  RenderContext.DepthFunc := SavedDepthFunc;
+
+  { PATCH-DIAG (Vatokat): время всего shadow-volume прохода -> sv_diag.log }
+  Inc(GSVDiagCount);
+  GSVDiagTicks := GSVDiagTicks + (GetTickCount64 - SVT0);
+  if GSVDiagCount >= 120 then
+  begin
+    SVDiagLog(Format(
+      'SVRender avg=%.2f ms n=%d | opaque1=%.2f opaque2=%.2f stencil1=%.2f opaque3=%.2f prepass=%.2f stencil2=%.2f transp=%.2f',
+      [GSVDiagTicks / GSVDiagCount, GSVDiagCount,
+       GSVOpaque1 / GSVDiagCount, GSVOpaque2 / GSVDiagCount,
+       GSVStencil1 / GSVDiagCount, GSVOpaque3 / GSVDiagCount,
+       GSVPrepass / GSVDiagCount, GSVStencil2 / GSVDiagCount,
+       GSVTransp / GSVDiagCount]));
+    GSVDiagCount := 0;
+    GSVDiagTicks := 0;
+    GSVOpaque1 := 0; GSVOpaque2 := 0; GSVStencil1 := 0; GSVOpaque3 := 0;
+    GSVPrepass := 0; GSVStencil2 := 0; GSVTransp := 0;
+  end;
 end;
 
 procedure TGLShadowVolumeRenderer.SetDebugRender(const Value: Boolean);

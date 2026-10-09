@@ -132,6 +132,10 @@
       fields. }
     Matrix: TMatrix4;
 
+    { Projection of this render pass, including shadow map sub-views.
+      Kept independently of Camera, which is nil for generated cameras. }
+    Projection: TMatrix4;
+
     { Inverse of @link(Matrix).
 
       Always call InverseMatrixNeeded before using it,
@@ -204,13 +208,20 @@
       Matches shape that are opaque (TGLShape.UseBlending = @false)
       or transparent (TGLShape.UseBlending = @true).
 
-      Note: When UsingBlending = @true, always DisableShadowVolumeCastingLights = @false.
-      Shadow volumes simply don't allow transparent object
-      to function properly as shadow receivers.
+      Note: When UsingBlending = @true, DisableShadowVolumeCastingLights
+      is normally @false. Shadow volumes traditionally don't allow
+      transparent objects to function properly as shadow receivers.
       Reading [http://developer.nvidia.com/object/fast_shadow_volumes.html]
       notes: they also just do separate rendering pass to render the
       partially-transparent parts, IOW they also note that transparent parts
-      simply don't work at all with shadow volumes. }
+      simply don't work at all with shadow volumes.
+
+      PATCH (Vatokat): TGLShadowVolumeRenderer.Render now DOES use
+      DisableShadowVolumeCastingLights = @true with UsingBlending = @true,
+      for the "in shadow" (stencil <> 0) pass over transparent receivers,
+      so a semi-transparent shadow catcher is darkened where the shadow
+      falls. The ordering caveats above remain, but for a catcher quad
+      over the ground the result is correct. }
     UsingBlending: Boolean;
 
     { Render only shapes that may receive shadow volumes, or ones that don't,
@@ -236,6 +247,32 @@
     DisableShadowVolumeCastingLights: Boolean;
 
     InsideStencilTest: Boolean;
+
+    { Force depth buffer writes even in a blending (transparent) pass,
+      where TBlendingRenderer normally turns them off. Used by the shadow
+      volume renderer to give transparent shadow receivers a depth-buffer
+      presence for the z-fail volume counting. }
+    ForceDepthBufferUpdate: Boolean;
+
+    { Render only shapes marked as dedicated shadow catchers
+      (TCastleScene.ShadowCatcher). Used together with
+      @link(ForceDepthBufferUpdate) for the depth-only prepass, so that
+      generic transparent shapes are never forced to write depth (which
+      would corrupt their blending). }
+    OnlyShadowCatchers: Boolean;
+
+    { Skip shapes marked as dedicated shadow catchers
+      (TCastleScene.ShadowCatcher). Used by the shadow volume renderer's
+      lit pass: a catcher is drawn only in the dark pass (inside shadow),
+      so outside the shadow it stays fully invisible and the ground shows
+      through untouched. }
+    ExcludeShadowCatchers: Boolean;
+
+    { Render the pass depth-only: color writes are masked per shape
+      (via TCastleRenderOptions.InternalColorChannels, since the renderer
+      reapplies them per shape anyway). Used by the shadow volume renderer
+      for the shadow-catcher depth prepass. }
+    OnlyDepth: Boolean;
 
     procedure Init;
   end;
@@ -465,6 +502,7 @@ begin
   Camera := ACamera;
   View := ACamera.WorldView;
   Matrix := ACamera.Matrix;
+  Projection := ACamera.ProjectionMatrix;
   InverseMatrixDone := false;
   RotationMatrix := ACamera.RotationMatrix;
   RotationInverseMatrixDone := false;
@@ -490,6 +528,7 @@ begin
   Camera := nil;
   View := AViewVectors;
   Matrix := View.Matrix;
+  Projection := ProjectionMatrix;
   InverseMatrixDone := false;
   RotationMatrix := View.RotationMatrix;
   RotationInverseMatrixDone := false;
@@ -500,6 +539,7 @@ procedure TRenderingCamera.Assign(const Source: TRenderingCamera);
 begin
   FTarget                   := Source.FTarget                  ;
   Matrix                    := Source.Matrix                   ;
+  Projection                := Source.Projection               ;
   InverseMatrix             := Source.InverseMatrix            ;
   InverseMatrixDone         := Source.InverseMatrixDone        ;
   RotationMatrix            := Source.RotationMatrix           ;

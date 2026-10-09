@@ -166,6 +166,8 @@ type
       FOnCustomShapeSort: TShapeSortEvent;
       FUpdateSoundListener: Boolean;
 
+    FShadowCasterClearDepth: Boolean;
+    FShadowCasterSubset: TCastleTransformList; { borrowed during an explicit subset pass }
       AllShapesCollector, FilteredShapesCollector: TShapesCollector;
       ShapesRenderer: TShapesRenderer;
 
@@ -465,6 +467,18 @@ type
         You can set this field manually. }
       CustomRenderingPass: TUserRenderingPass;
 
+    { Render selected transforms in their existing world. Does not reparent them
+      or traverse unrelated terrain. Uses the normal renderer and mesh cache. }
+    procedure InternalRenderShadowCasters(const Camera: TRenderingCamera;
+      const Casters: TCastleTransformList; const Filter: TCollectedShapeFilter = nil;
+      const ClearDepthBuffer: Boolean = True);
+    { Also supports a color pass, with the viewport's normal global lights.
+      Used to warm driver shader variants without displaying loading models. }
+    procedure InternalRenderSubset(const Camera: TRenderingCamera;
+      const Items: TCastleTransformList; const Filter: TCollectedShapeFilter = nil;
+      const ClearDepthBuffer: Boolean = True);
+
+    var
       { Set these to non-1 to deliberately distort field of view / aspect ratio.
         This is useful for special effects when you want to create unrealistic
         projection.
@@ -1407,7 +1421,7 @@ var
 
 implementation
 
-uses DOM, Math, TypInfo,
+uses DOM, Math, TypInfo, CastleFrustum,
   CastleGLUtils, CastleLog, CastleStringUtils,
   CastleSoundEngine, CastleGLVersion, CastleTextureImages, X3DFields,
   CastleInternalSettings, CastleXmlUtils, CastleUriUtils, CastleInternalRenderer,
@@ -2600,7 +2614,8 @@ procedure TCastleViewport.RenderOnePass(const Params: TRenderParams;
 begin
   FilteredShapesCollector.Clear;
   FilteredShapesCollector.AddFiltered(AllShapesCollector,
-    [PassParams.UsingBlending], PassParams.FilterShadowVolumesReceivers);
+    [PassParams.UsingBlending], PassParams.FilterShadowVolumesReceivers,
+    PassParams.OnlyShadowCatchers, PassParams.ExcludeShadowCatchers);
 
   ShapesRenderer.OcclusionSort := EffectiveOcclusionSort;
   ShapesRenderer.BlendingSort := EffectiveBlendingSort;
@@ -2783,6 +2798,11 @@ procedure TCastleViewport.RenderFromView3D(const Params: TRenderParams);
 
 var
   MainLightPosition: TVector4;
+  Caster: TCastleTransform;
+  ParentTransformation: TTransformation;
+  LocalFrustum: TFrustum;
+  SavedTransformation: PTransformation;
+  SavedFrustum: PFrustum;
 begin
   { Calculate contents of AllShapesCollector.
     This way Items.Render, with all transformation calcuations,
@@ -2791,17 +2811,68 @@ begin
   AllShapesCollector.Clear;
   Assert(Params.Collector = AllShapesCollector);
   Params.Frustum := @Params.RenderingCamera.Frustum;
-  Params.UsingShadowVolumes :=
+  Params.UsingShadowVolumes := (FShadowCasterSubset = nil) and
     GLFeatures.ShadowVolumesPossible and
     ShadowVolumes and
     MainLightForShadowVolumes(MainLightPosition);
-  Items.Render(Params);
+  if FShadowCasterSubset = nil then
+    Items.Render(Params)
+  else
+  begin
+    SavedTransformation := Params.Transformation;
+    SavedFrustum := Params.Frustum;
+    try
+      for Caster in FShadowCasterSubset do
+        if Caster.ExistsInRoot and Caster.HasWorldTransform then
+        begin
+          ParentTransformation.Init;
+          if Caster.Parent <> nil then
+            ParentTransformation.MultiplyMatrix(Caster.Parent.WorldTransform);
+          LocalFrustum := Params.RenderingCamera.Frustum.TransformByInverse(ParentTransformation.Transform);
+          Params.Transformation := @ParentTransformation;
+          Params.Frustum := @LocalFrustum;
+          Caster.Render(Params);
+        end;
+    finally
+      Params.Transformation := SavedTransformation;
+      Params.Frustum := SavedFrustum;
+    end;
+  end;
 
   // call RenderOnePass multiple times, filtering AllShapesCollector in different ways
   if Params.UsingShadowVolumes then
     RenderWithShadowVolumes(MainLightPosition)
   else
     RenderNoShadowVolumes;
+end;
+
+procedure TCastleViewport.InternalRenderShadowCasters(const Camera: TRenderingCamera;
+  const Casters: TCastleTransformList; const Filter: TCollectedShapeFilter;
+  const ClearDepthBuffer: Boolean);
+begin
+  Assert(Camera.Target = rtShadowMap);
+  InternalRenderSubset(Camera, Casters, Filter, ClearDepthBuffer);
+end;
+
+procedure TCastleViewport.InternalRenderSubset(const Camera: TRenderingCamera;
+  const Items: TCastleTransformList; const Filter: TCollectedShapeFilter;
+  const ClearDepthBuffer: Boolean);
+var SavedClearDepth: Boolean; SavedSubset: TCastleTransformList; SavedFilter: TCollectedShapeFilter;
+begin
+  Assert(Items <> nil);
+  SavedClearDepth := FShadowCasterClearDepth;
+  FShadowCasterClearDepth := ClearDepthBuffer;
+  SavedSubset := FShadowCasterSubset;
+  SavedFilter := AllShapesCollector.ShapeFilter;
+  AllShapesCollector.ShapeFilter := Filter;
+  FShadowCasterSubset := Items;
+  try
+    RenderFromViewEverything(Camera);
+  finally
+    FShadowCasterClearDepth := SavedClearDepth;
+    FShadowCasterSubset := SavedSubset;
+    AllShapesCollector.ShapeFilter := SavedFilter;
+  end;
 end;
 
 function TCastleViewport.GetBackgroundRenderer: TBackgroundRenderer;
@@ -2832,6 +2903,11 @@ procedure TCastleViewport.RenderFromViewEverything(const RenderingCamera: TRende
     { Make ClearColor anything defined.
       If we will include cbColor in ClearBuffers, it will actually always
       be adjusted to something appropriate. }
+    if FShadowCasterSubset <> nil then
+    begin
+      if FShadowCasterClearDepth then RenderContext.Clear([cbDepth], Black);
+      Exit;
+    end;
     ClearColor := Black;
     ClearBuffers := [];
 
@@ -2922,7 +2998,7 @@ var
   SceneCastingLights: TCastleScene;
 begin
   RenderClear;
-  RenderBackground;
+  if FShadowCasterSubset = nil then RenderBackground;
 
   if GLFeatures.EnableFixedFunction then
   begin
@@ -2949,6 +3025,9 @@ begin
 
   { calculate FRenderParams.FGlobalLights }
   FRenderParams.FGlobalLights.Clear;
+  if (FShadowCasterSubset = nil) or
+     not (RenderingCamera.Target in [rtShadowMap, rtVarianceShadowMap]) then
+  begin
   { Add headlight }
   InitializeGlobalLights(FRenderParams.FGlobalLights);
   { Add lights from MainScene  }
@@ -2961,6 +3040,8 @@ begin
       if Items.MainScene <> SceneCastingLights then // MainScene is already accounted for above
         AddGlobalLightsFromScene(SceneCastingLights);
   {$warnings on}
+
+  end;
 
   { calculate FRenderParams.GlobalFog }
   if Fog <> nil then
@@ -3711,7 +3792,10 @@ begin
       So display it by default. }
     TimeStart := Profiler.Start(Format('TCastleViewport(%s).PrepareResources', [Name]));
     try
-      PrepareResources;
+      { Prepare the resources needed before collecting shapes, but compile
+        programs in the actual pass. Full dummy-camera preparation links
+        unused light variants and all hidden Switch/LOD alternatives. }
+      PrepareResources(DefaultPrepareOptions - [prRenderSelf, prRenderClones]);
     finally Profiler.Stop(TimeStart, true, true) end;
     PrepareResourcesDone := true;
   end;

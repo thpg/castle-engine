@@ -23,6 +23,8 @@
 
   { OpenGL resource of a texture node. }
   TTextureResource = class(TRendererResource)
+  strict private
+    class var RegisteredClasses: array of TTextureResourceClass;
   protected
     { Calculate things from TextureProperties node.
       If TextureProperties = @nil, they are taken from defaults
@@ -72,6 +74,10 @@
 
       @italic(Descedants implementors): override IsClassForTextureNode
       to be correctly recognized by this. }
+    { Application-defined texture resources. Register during initialization,
+      before renderer/worker threads start; unregister during finalization. }
+    class procedure RegisterClass(const ResourceClass: TTextureResourceClass);
+    class procedure UnregisterClass(const ResourceClass: TTextureResourceClass);
     class function ClassForTextureNode(
       ANode: TAbstractTextureNode): TTextureResourceClass;
   public
@@ -440,6 +446,10 @@
       const ProjectionNear, ProjectionFar: Single;
       const Light: TAbstractPunctualLightNode);
 
+    { Explicit depth atlas tile. Callback must not change scissor state. }
+    procedure UpdateRegion(const Render: TRenderFromViewFunction;
+      const Light: TAbstractPunctualLightNode; const X, Y, Width, Height: Integer);
+
     { Check would we use Variance Shadow Maps with current ARenderer
       attributes and OpenGL version/extensions. }
     class function ClassVarianceShadowMaps(RenderOptions: TCastleRenderOptions): boolean;
@@ -636,8 +646,31 @@ begin
     Filter, Dummy[0], Dummy[1], Dummy[2], Anisotropy, GUITexture);
 end;
 
+class procedure TTextureResource.RegisterClass(const ResourceClass: TTextureResourceClass);
+var I: Integer;
+begin
+  for I := 0 to High(RegisteredClasses) do
+    if RegisteredClasses[I] = ResourceClass then Exit;
+  SetLength(RegisteredClasses, Length(RegisteredClasses) + 1);
+  RegisteredClasses[High(RegisteredClasses)] := ResourceClass;
+end;
+
+class procedure TTextureResource.UnregisterClass(const ResourceClass: TTextureResourceClass);
+var I, J: Integer;
+begin
+  for I := 0 to High(RegisteredClasses) do
+    if RegisteredClasses[I] = ResourceClass then
+    begin
+      for J := I to High(RegisteredClasses) - 1 do
+        RegisteredClasses[J] := RegisteredClasses[J + 1];
+      SetLength(RegisteredClasses, Length(RegisteredClasses) - 1);
+      Exit;
+    end;
+end;
+
 class function TTextureResource.ClassForTextureNode(
   ANode: TAbstractTextureNode): TTextureResourceClass;
+var I: Integer;
 
   function TryResult(C: TTextureResourceClass): boolean;
   begin
@@ -647,8 +680,9 @@ class function TTextureResource.ClassForTextureNode(
   end;
 
 begin
-  { TODO: in the future, some way of registering class for this will
-    be done. For now, just try known final TTextureResource descendants. }
+  for I := High(RegisteredClasses) downto 0 do
+    if TryResult(RegisteredClasses[I]) then Exit;
+  { Built-in resources remain the fallback. }
   if not (TryResult(TMultiTextureResource) or
           TryResult(TImageTextureResource) or
           TryResult(TMovieTextureResource) or
@@ -1015,9 +1049,28 @@ end;
 
 { TImageTextureResource -------------------------------------------------------- }
 
+{ Only the first non-empty URL may skip decoding. Looking through the entire
+  fallback list could select a cached later URL while an earlier URL is valid.
+  Already-loaded images (including LoadFromImage) always use the normal path. }
+function CachedImageTextureUrl(const Node: TAbstractTextureNode): String;
+var Tex: TImageTextureNode; I: Integer;
+begin
+  Result := '';
+  if not (Node is TImageTextureNode) then Exit;
+  Tex := TImageTextureNode(Node);
+  if Tex.IsTextureLoaded then Exit;
+  for I := 0 to Tex.FdUrl.Count - 1 do
+    if Tex.FdUrl.Items[I] <> '' then
+      Exit(Tex.PathFromBaseUrl(Tex.FdUrl.Items[I]));
+end;
+
 class function TImageTextureResource.IsClassForTextureNode(
   ANode: TAbstractTextureNode): boolean;
+var Url: String;
 begin
+  Url := CachedImageTextureUrl(ANode);
+  if (Url <> '') and RendererCache.TextureImage_HasUrl(Url,
+    TImageTextureNode(ANode).FlipVertically) then Exit(True);
   Result := (ANode is TAbstractTexture2DNode) and
     TAbstractTexture2DNode(ANode).IsTextureImage;
 end;
@@ -1036,9 +1089,9 @@ var
   BoundaryModeT: TGLenum;
   TextureWrap: TTextureWrap2D;
   GUITexture, FlipVertically: boolean;
+  Url: String;
+  Cached: TTextureImageCache;
 begin
-  { HandledNode already made sure IsTextureImage = @true }
-
   HandleTextureProperties(TextureNode.TextureProperties, RenderOptions,
     TextureRepeatToGL(TextureNode.RepeatS), TextureRepeatToGL(TextureNode.RepeatT),
     Filter, BoundaryModeS, BoundaryModeT, Anisotropy, GUITexture);
@@ -1050,8 +1103,29 @@ begin
     (TextureNode is TImageTextureNode) and
     TImageTextureNode(TextureNode).FlipVertically;
 
+  Url := CachedImageTextureUrl(TextureNode);
+  if Url <> '' then
+  begin
+    Cached := RendererCache.TextureImage_Find(Url, Filter, Anisotropy,
+      TextureWrap, GUITexture, FlipVertically);
+    if Cached <> nil then
+    begin
+      Inc(Cached.References);
+      FGLName := Cached.GLName;
+      FAllocatedWidth := Cached.SourceWidth;
+      FAllocatedHeight := Cached.SourceHeight;
+      TextureNode.InternalUseCachedTextureMetadata(Url, Cached.SourceAlpha);
+      Exit;
+    end;
+  end;
+
+  { A cached URL allowed dispatch without loading. A different sampler still
+    needs the normal image/decode/upload path, including failure handling. }
+  if not TextureNode.IsTextureImage then Exit;
+
   FGLName := RendererCache.TextureImage_IncReference(
     TextureNode.TextureImage,
+    TextureNode.InternalTextureAlpha,
     TextureNode.TextureUsedFullUrl,
     Filter,
     Anisotropy,
@@ -1351,6 +1425,7 @@ begin
 
     FGLName := RendererCache.TextureImage_IncReference(
       InitialImage,
+      acNone,
       '' { generated texture contents means empty URL },
       Filter,
       Anisotropy,
@@ -2330,6 +2405,63 @@ begin
 
   if NeedsMipmaps then
     RenderToTexture.GenerateMipmap;
+end;
+
+procedure TGeneratedShadowMapResource.UpdateRegion(const Render: TRenderFromViewFunction;
+  const Light: TAbstractPunctualLightNode; const X, Y, Width, Height: Integer);
+var
+  SavedProjection: TMatrix4;
+  SavedViewport, SavedScissor, Region: TRectangle;
+  SavedDelta: TVector2Integer;
+  SavedOffset: TPolygonOffset;
+  HadScissor, SavedDepthWrite: Boolean;
+  Camera: TRenderingCamera;
+  View: TViewVectors;
+begin
+  if FGLName = GLObjectNone then Exit;
+  Assert(not VarianceShadowMaps);
+  Region := Rectangle(X, Y, Width, Height);
+  Assert((Region.Left >= 0) and (Region.Bottom >= 0) and
+    (Region.Right <= Integer(Size)) and (Region.Top <= Integer(Size)));
+  Camera := TRenderingCamera.Create;
+  try
+    Camera.Target := rtShadowMap;
+    Light.GetView(View);
+    Camera.FromViewVectors(View, Light.ProjectionMatrix);
+    SavedViewport := RenderContext.Viewport;
+    SavedDelta := RenderContext.ViewportDelta;
+    SavedProjection := RenderContext.ProjectionMatrix;
+    SavedOffset := RenderContext.PolygonOffset;
+    HadScissor := RenderContext.FinalScissor(SavedScissor);
+    SavedDepthWrite := RenderContext.DepthBufferUpdate;
+    RenderToTexture.RenderBegin;
+    try
+      RenderContext.DepthBufferUpdate := True;
+      RenderContext.ViewportDelta := Vector2Integer(0, 0);
+      RenderContext.Viewport := Region;
+      RenderContext.ProjectionMatrix := Light.ProjectionMatrix;
+      RenderContext.PolygonOffsetEnable(TextureNode.FdScale.Value, TextureNode.FdBias.Value);
+      { This offscreen pass must ignore window/UI clipping. Temporarily override
+        only the GL scissor, leaving the context's logical scissor stack intact;
+        the callback does no UI rendering and cannot mutate that stack. }
+      glEnable(GL_SCISSOR_TEST);
+      glScissor(Region.Left, Region.Bottom, Region.Width, Region.Height);
+      Render(Camera);
+    finally
+      if HadScissor then
+        glScissor(SavedScissor.Left, SavedScissor.Bottom, SavedScissor.Width, SavedScissor.Height)
+      else
+        glDisable(GL_SCISSOR_TEST);
+      RenderContext.DepthBufferUpdate := SavedDepthWrite;
+      RenderContext.PolygonOffset := SavedOffset;
+      RenderContext.ProjectionMatrix := SavedProjection;
+      RenderContext.ViewportDelta := SavedDelta;
+      RenderContext.Viewport := SavedViewport;
+      RenderToTexture.RenderEnd;
+    end;
+  finally
+    Camera.Free;
+  end;
 end;
 
 function TGeneratedShadowMapResource.GLName: TGLTextureId;

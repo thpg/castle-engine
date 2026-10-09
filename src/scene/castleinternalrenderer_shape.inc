@@ -45,6 +45,15 @@
 
     Cache: TShapeCache;
 
+    { Read-only access for GPU surface queries. Borrowed GL names remain owned
+      by the renderer and must be refreshed after a context/cache rebuild. }
+    function SurfaceQueryBuffers(out Coordinates, Indices: TGLBuffer;
+      out Stride, VertexCount, IndexCount: Cardinal): Boolean;
+    { Prepare only static indexed geometry in the native cache, without
+      textures, shaders or drawing. Call on the GL thread on a query miss. }
+    function PrepareSurfaceQueryBuffers(const RenderOptions: TCastleRenderOptions): Boolean;
+  public
+
     { Assign this each time before passing this shape to RenderShape. }
     Fog: TFogFunctionality;
 
@@ -72,6 +81,68 @@
 {$endif read_interface}
 
 {$ifdef read_implementation}
+
+type
+  { Access the existing owner lifecycle without preparing scene materials. }
+  TSurfaceQueryTransformAccess = class(TCastleTransform);
+
+function TX3DRendererShape.SurfaceQueryBuffers(out Coordinates, Indices: TGLBuffer;
+  out Stride, VertexCount, IndexCount: Cardinal): Boolean;
+begin
+  Coordinates := 0; Indices := 0; Stride := 0; VertexCount := 0; IndexCount := 0;
+  Result := (Cache <> nil) and (Cache.Arrays <> nil);
+  if not Result then Exit;
+  Result := Cache.VboCoordinatePreserveGeometryOrder and
+    (Cache.Arrays.Primitive = gpTriangles) and Cache.Arrays.HasIndexes and
+    (Cache.Vbo[vtCoordinate] <> 0) and (Cache.Vbo[vtIndex] <> 0) and
+    (Cache.VboToReload = []);
+  if not Result then Exit;
+  Coordinates := Cache.Vbo[vtCoordinate]; Indices := Cache.Vbo[vtIndex];
+  Stride := Cache.Arrays.CoordinateSize;
+  VertexCount := Cache.Arrays.Count; IndexCount := Cache.Arrays.IndexesCount;
+end;
+
+function TX3DRendererShape.PrepareSurfaceQueryBuffers(
+  const RenderOptions: TCastleRenderOptions): Boolean;
+var
+  Coordinates, Indices: TGLBuffer;
+  Stride, VertexCount, IndexCount: Cardinal;
+  GeneratorClass: TArraysGeneratorClass;
+  Generator: TArraysGenerator;
+  OldArray, OldIndex: GLint;
+begin
+  if SurfaceQueryBuffers(Coordinates, Indices, Stride, VertexCount, IndexCount) then
+    Exit(true);
+  Result := false;
+  if not ApplicationProperties.IsGLContextOpen or not GLFeatures.VertexBufferObject or
+     not (Geometry is TIndexedFaceSetNode) or (State.Skin <> nil) or
+     (ParentScene = nil) then Exit;
+  GeneratorClass := GetArraysGenerator(Geometry);
+  if GeneratorClass = nil then Exit;
+  { A tile first requested in Focus may never have called scene PrepareResources.
+    Register its normal GLContextClose before acquiring any cached resources. }
+  TSurfaceQueryTransformAccess(ParentScene).RegisterGLContextClose;
+  if Cache = nil then Cache := RendererCache.Shape_IncReference(Self, RenderOptions);
+  { IncReference may have returned a cache already prepared by another shape. }
+  if SurfaceQueryBuffers(Coordinates, Indices, Stride, VertexCount, IndexCount) then
+    Exit(true);
+  { The same cache owns both preparations. Never change a valid warm cache,
+    and force all VBO data to reload when a later draw completes the layout. }
+  Cache.SurfaceQueryOnly := true;
+  Cache.InvalidateVertexData(AllVboTypes);
+  FreeAndNil(Cache.Arrays);
+  Generator := GeneratorClass.Create(Self);
+  try Cache.Arrays := Generator.GenerateArrays;
+  finally Generator.Free end;
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, @OldArray);
+  glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, @OldIndex);
+  try LoadArraysToVbo;
+  finally
+    RenderContext.BindBuffer[btArray] := OldArray;
+    RenderContext.BindBuffer[btElementArray] := OldIndex;
+  end;
+  Result := SurfaceQueryBuffers(Coordinates, Indices, Stride, VertexCount, IndexCount);
+end;
 
 { Sometimes the updates indicated by Shape.Cache.VboToReload can be performed without
   actually recreating the Shape.Cache.Arrays (so no need to create TArraysGenerator

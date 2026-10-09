@@ -94,6 +94,14 @@ type
     DepthRange: TDepthRange;
     ShadowVolumesReceiver: Boolean;
 
+    { PATCH (Vatokat): this shape is a dedicated transparent shadow catcher —
+      the shadow volume renderer gives it a depth-buffer presence (only for
+      the z-fail counting) so it can receive shadows without any opaque
+      surface behind. Generic transparent shapes never get this treatment
+      (depth writes would corrupt their blending). Mirrors
+      TCastleScene.ShadowCatcher. }
+    ShadowCatcher: Boolean;
+
     { Should rendering this use blending (to account for partial transparency). }
     function UseBlending: Boolean;
   end;

@@ -96,26 +96,20 @@ procedure TShaderCodeHash.AddEffects(Nodes: TX3DNodeList);
 var
   I: Integer;
 begin
-  { We add to hash actual Effect node references (pointers), this way ensuring
-    that to share the same shader, effect nodes must be the same.
-    Merely equal GLSL source code is not enough (because effects with equal
-    source code may still have different uniform values, and sharing them
-    would not be handled correctly here --- we set uniform values on change,
-    not every time before rendering shape). }
+  { Opt-in effects refresh uniforms before each draw. Other effects retain
+    their node identity because their uniforms are updated on events. }
   for I := 0 to Nodes.Count - 1 do
     if (Nodes[I] is TEffectNode) and
        TEffectNode(Nodes[I]).FdEnabled.Value then
-      AddPointer(Nodes[I]);
+      if TEffectNode(Nodes[I]).InternalSharedCodeKey <> '' then
+        AddString(IntToStr(I) + ':' + TEffectNode(Nodes[I]).InternalSharedCodeKey, 104729)
+      else
+        AddPointer(Nodes[I]);
 end;
 
 procedure TShaderCodeHash.AddEffects(Nodes: TMFNode);
-var
-  I: Integer;
 begin
-  for I := 0 to Nodes.Count - 1 do
-    if (Nodes[I] is TEffectNode) and
-       TEffectNode(Nodes[I]).FdEnabled.Value then
-      AddPointer(Nodes[I]);
+  AddEffects(Nodes.InternalItems);
 end;
 
 function TShaderCodeHash.ToString: String;

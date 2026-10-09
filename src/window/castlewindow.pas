@@ -3153,7 +3153,14 @@ begin
 end;
 
 procedure TCastleWindow.DoRender;
+{$ifdef REZVIVO_STARTUP_TIMING}
+var
+  TimingStart: QWord;
+{$endif}
 begin
+  {$ifdef REZVIVO_STARTUP_TIMING}
+  TimingStart := GetTickCount64;
+  {$endif}
   FrameProfiler.Start(fmBeforeRender);
   { We set Invalidated := false before EventRender (that calls OnRender),
     because we guarantee that calling Invalidate within OnRender will
@@ -3161,6 +3168,10 @@ begin
   Invalidated := false;
   MakeCurrent;
   Container.EventBeforeRender;
+  {$ifdef REZVIVO_STARTUP_TIMING}
+  if GetTickCount64 - TimingStart >= 100 then
+    WritelnLog('StartupTiming', 'before-render ms=%d', [GetTickCount64 - TimingStart]);
+  {$endif}
   FrameProfiler.Stop(fmBeforeRender);
 
   if Closed then Exit; { check, in case window got closed in the event }
@@ -3168,14 +3179,28 @@ begin
   FrameProfiler.Start(fmRender);
   Container.Fps.InternalRenderBegin;
   try
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    TimingStart := GetTickCount64;
+    {$endif}
     Container.EventRender;
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    if GetTickCount64 - TimingStart >= 100 then
+      WritelnLog('StartupTiming', 'render ms=%d', [GetTickCount64 - TimingStart]);
+    {$endif}
     if Closed then Exit; { check, in case window got closed in the event }
 
     if GLVersion.BuggySwapNonStandardViewport then
       RenderContext.Viewport := Rect;
 
     FrameProfiler.Start(fmRenderSwapFlush);
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    TimingStart := GetTickCount64;
+    {$endif}
     if HasDoubleBuffer then SwapBuffers else glFlush;
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    if GetTickCount64 - TimingStart >= 100 then
+      WritelnLog('StartupTiming', 'swap ms=%d', [GetTickCount64 - TimingStart]);
+    {$endif}
 
     { Keep this check inside fmRenderSwapFlush measurement.
 

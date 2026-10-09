@@ -52,7 +52,7 @@ procedure ProcessShadowMapsReceivers(Model: TX3DNode; Shapes: TShapeTree;
 
 implementation
 
-uses SysUtils, Generics.Collections,
+uses SysUtils, Classes, Generics.Collections,
   CastleUtils, CastleStringUtils, CastleImages,
   CastleBoxes, CastleLog, CastleVectors, CastleRectangles;
 

@@ -54,6 +54,11 @@ type
 
   TBeforeShapeRenderProc = procedure (Shape: TShape) of object;
 
+  { Optional render-only selection, evaluated with the actual view/shadow pass.
+    It must not mutate the scene graph or advance animation. }
+  TRenderShapeFilter = function (const Shape: TAbstractShapeNode;
+    const Params: TRenderParams): Boolean of object;
+
   TRenderingAttributesEvent = TCastleRenderOptionsEvent deprecated 'use TCastleRenderOptionsEvent';
   TSceneRenderingAttributes = TCastleRenderOptions deprecated 'use TCastleRenderOptions';
 
@@ -147,7 +152,9 @@ type
       FDistanceCulling: Single;
 
       FReceiveShadowVolumes: Boolean;
+      FShadowCatcher: Boolean;
       FTempPrepareParams: TPrepareParams;
+      FOnRenderShapeFilter: TRenderShapeFilter;
 
       { Camera position, in local scene coordinates, known during
         the LocalRender or LocalRenderShadowVolume calls. }
@@ -167,6 +174,7 @@ type
       FrustumForShapeCulling: PFrustum;
 
       FShapeFrustumCulling, FSceneFrustumCulling: Boolean;
+      FSceneOcclusionCulling: Boolean;
       FRenderOptions: TCastleRenderOptions;
       FTransformOptimization: TTransformOptimization;
 
@@ -548,6 +556,9 @@ type
       See https://castle-engine.io/shaders for documentation
       how shader effects work in Castle Game Engine. }
     procedure SetEffects(const Value: array of TEffectNode);
+
+    property OnRenderShapeFilter: TRenderShapeFilter
+      read FOnRenderShapeFilter write FOnRenderShapeFilter;
   published
     { Improve performance of rendering by checking for each shape whether
       it is inside frustum (camera pyramid of view) before rendering.
@@ -572,9 +583,25 @@ type
     property SceneFrustumCulling: Boolean
       read FSceneFrustumCulling write FSceneFrustumCulling default true;
 
+    { REZVIVO: allow this scene to participate in viewport occlusion queries.
+      Disable for GPU-deformed meshes whose CPU bounding boxes do not bound
+      the rendered pose. Depth testing still hides them behind real walls. }
+    property SceneOcclusionCulling: Boolean
+      read FSceneOcclusionCulling write FSceneOcclusionCulling default true;
+
     { Does this scene receive shadows by shadow volumes. }
     property ReceiveShadowVolumes: boolean
       read FReceiveShadowVolumes write FReceiveShadowVolumes default true;
+
+    { PATCH (Vatokat): mark this scene as a dedicated transparent shadow
+      catcher. The shadow volume renderer gives it a depth-buffer presence
+      (color-masked prepass, only for the z-fail counting) so it receives
+      volume shadows even with no opaque surface behind it. Use only for a
+      shadow-catcher quad hugging the ground: opaque receivers behind it
+      keep only their base lighting under it. Generic transparent scenes
+      must stay @false — depth writes would corrupt their blending. }
+    property ShadowCatcher: Boolean
+      read FShadowCatcher write FShadowCatcher default false;
 
     { Cull shapes farther than this distance. Ignored if <= 0. }
     property DistanceCulling: Single
@@ -767,8 +794,10 @@ begin
 
   FSceneFrustumCulling := true;
   FShapeFrustumCulling := true;
+  FSceneOcclusionCulling := true;
 
   FReceiveShadowVolumes := true;
+  FShadowCatcher := false;
 
   FilteredShapes := TShapeList.Create;
   FTempPrepareParams := TPrepareParams.Create;
@@ -929,12 +958,14 @@ begin
 
   Render_Collector.Add(Shape, EffectiveRenderOptions,
     Render_Params.Transformation^.Transform, SceneTransformDynamic,
-    Render_Params.DepthRange, ReceiveShadowVolumes);
+    Render_Params.DepthRange, ReceiveShadowVolumes, ShadowCatcher);
   IsVisibleNow := true;
 end;
 
 procedure TCastleScene.CollectShape_SomeTests(const Shape: TGLShape);
 begin
+  if Assigned(FOnRenderShapeFilter) and
+     not FOnRenderShapeFilter(Shape.Node, Render_Params) then Exit;
   if (Shape <> AvoidShapeRendering) and
      ( (not AvoidNonShadowCasterRendering) or Shape.ShadowCaster) and
      ( { implement TAbstractShapeNode.Visible here, by a trivial check }
@@ -1023,10 +1054,19 @@ var
   var
     ShapeList: TShapeList;
     Shape: TShape;
+    PrepareTick, PrepareMs: QWord;
   begin
     ShapeList := Shapes.TraverseList(false, false);
     for Shape in ShapeList do
+    begin
+      { REZVIVO: only reached when scene texture resources are unprepared. }
+      PrepareTick := GetTickCount64;
       TGLShape(Shape).PrepareResources;
+      PrepareMs := GetTickCount64 - PrepareTick;
+      if PrepareMs > 100 then
+        WritelnLog('ResourcePrepare', 'stage=shape_textures ms=%d scene=%p name="%s" shape="%s"',
+          [PrepareMs, Pointer(Self), Name, Shape.NiceName]);
+    end;
   end;
 
   procedure PrepareRenderShapes;
@@ -1036,6 +1076,7 @@ var
     ReceivedGlobalLights: TLightInstancesList;
     DummyCamera: TRenderingCamera;
     DummyStatistics: TRenderStatistics;
+    PrepareTick, PrepareMs: QWord;
   begin
     if LogRenderer then
       WritelnLog('Renderer', 'Preparing rendering of all shapes');
@@ -1076,6 +1117,7 @@ var
 
       for Shape in ShapeList do
       begin
+        PrepareTick := GetTickCount64;
         TGLShape(Shape).Fog := ShapeFog(Shape, Params.GlobalFog as TFogNode);
         Renderer.RenderShape(TGLShape(Shape), RenderOptions,
           { Pass sensible SceneTransform parameter below,
@@ -1085,6 +1127,10 @@ var
             (so identity is OK, zero is not OK). }
           TMatrix4.Identity,
           false, drFull);
+        PrepareMs := GetTickCount64 - PrepareTick;
+        if PrepareMs > 100 then
+          WritelnLog('ResourcePrepare', 'stage=render_shape ms=%d scene=%p name="%s" shape="%s" geometry=%s',
+            [PrepareMs, Pointer(Self), Name, Shape.NiceName, Shape.Geometry.X3DType]);
       end;
 
       Renderer.RenderEnd;
@@ -1097,6 +1143,7 @@ var
   I: Integer;
   PossiblyTimeConsuming: Boolean;
   TimeStart: TCastleProfilerTime;
+  PrepareTick, PrepareMs: QWord;
 begin
   inherited;
 
@@ -1126,7 +1173,8 @@ begin
 
   Inc(InternalDirty);
   try
-    PossiblyTimeConsuming := (not PreparedShapesResources) or (not PreparedRender);
+    PossiblyTimeConsuming := (not PreparedShapesResources) or
+      (([prRenderSelf, prRenderClones] * Options <> []) and not PreparedRender);
 
     if PossiblyTimeConsuming then
       TimeStart := Profiler.Start('Prepare Scene Resources ' + URL);
@@ -1140,7 +1188,12 @@ begin
       { Use PreparedShapesResources to avoid expensive (for large scenes)
         iteration over all shapes in every TCastleScene.PrepareResources call. }
       PreparedShapesResources := true;
+      PrepareTick := GetTickCount64;
       PrepareShapesResources;
+      PrepareMs := GetTickCount64 - PrepareTick;
+      if PrepareMs > 100 then
+        WritelnLog('ResourcePrepare', 'stage=scene_textures ms=%d scene=%p name="%s" url="%s"',
+          [PrepareMs, Pointer(Self), Name, UriDisplay(URL)]);
     end;
 
     if ([prRenderSelf, prRenderClones] * Options <> []) and not PreparedRender then
@@ -1148,7 +1201,12 @@ begin
       { We use PreparedRender to avoid potentially expensive iteration
         over shapes and expensive Renderer.RenderBegin/End. }
       PreparedRender := true;
+      PrepareTick := GetTickCount64;
       PrepareRenderShapes;
+      PrepareMs := GetTickCount64 - PrepareTick;
+      if PrepareMs > 100 then
+        WritelnLog('ResourcePrepare', 'stage=scene_render ms=%d scene=%p name="%s" url="%s"',
+          [PrepareMs, Pointer(Self), Name, UriDisplay(URL)]);
     end;
 
     if prBackground in Options then
@@ -1179,6 +1237,7 @@ procedure TCastleScene.LocalRenderOutside(
   procedure RenderWithShadowMaps;
   var
     SavedMode: TRenderingMode;
+    SavedAvoidNonShadowCasterRendering: Boolean;
   begin
     { For shadow maps, speed up rendering by using only features that affect
       depth output.  }
@@ -1190,9 +1249,16 @@ procedure TCastleScene.LocalRenderOutside(
       SavedMode := RenderOptions.Mode;
       RenderOptions.Mode := rmDepth;
 
-      RenderNormal;
-
-      RenderOptions.Mode := SavedMode;
+      { The map renders all viewport scenes, not only its owning scene.
+        Apply Appearance.shadowCaster filtering to every participating scene. }
+      SavedAvoidNonShadowCasterRendering := AvoidNonShadowCasterRendering;
+      AvoidNonShadowCasterRendering := true;
+      try
+        RenderNormal;
+      finally
+        AvoidNonShadowCasterRendering := SavedAvoidNonShadowCasterRendering;
+        RenderOptions.Mode := SavedMode;
+      end;
     end else
     begin
       RenderNormal;
@@ -1206,26 +1272,18 @@ begin
   if CheckVisible and
      (InternalDirty = 0) then
   begin
-    { I used to make here more complex "prepare" mechanism, that was trying
-      to prepare for particular shapes only right before they are rendered
-      (so instead of calling PrepareResources below, I was calling PrepareShape
-      at the beginning of each RenderShape and such).
-
-      After a while, it turns out this was a useless complication of code
-      logic. There are many things that *have* to be prepared before whole
-      rendering, for example
-      - Occlusion query id must be generated (as we may start occlusion query
-        before actually rendering the shape).
-
-      It's much simpler to just call PrepareResources at the beginning.
-      The PrepareResources is already optimized to do nothing,
-      if everything is ready. }
+    { Prepare textures before collecting shapes. Let the actual render pass
+      create VBOs and programs with its real camera, lights and depth mode.
+      Automatic prRenderSelf used a dummy camera and compiled every hidden
+      Switch/LOD choice, then linked additional variants in the real pass.
+      Explicit PrepareResources([prRenderSelf]) remains available for callers
+      that deliberately request full preloading. }
     FTempPrepareParams.GlobalLights := Params.GlobalLights;
     FTempPrepareParams.GlobalFog := Params.GlobalFog;
     Assert(Params.RendererToPrepareShapes <> nil);
     FTempPrepareParams.RendererToPrepareShapes := Params.RendererToPrepareShapes;
     {$warnings off} // calling deprecated, but for internal purpose -- do not warn
-    PrepareResources([prRenderSelf], FTempPrepareParams);
+    PrepareResources([], FTempPrepareParams);
     {$warnings on}
 
     RenderWithShadowMaps;
@@ -1582,6 +1640,9 @@ procedure TCastleScene.Update(const SecondsPassed: Single; var RemoveMe: TRemove
     procedure UpdateGeneratedShadowMap(TexNode: TGeneratedShadowMapNode);
     var
       TextureRes: TGeneratedShadowMapResource;
+      {$ifdef REZVIVO_STARTUP_TIMING}
+      TimingStart: QWord;
+      {$endif}
     begin
       if TexNode.GenTexFunctionality.NeedsUpdate then
       begin
@@ -1590,8 +1651,16 @@ procedure TCastleScene.Update(const SecondsPassed: Single; var RemoveMe: TRemove
           TextureRes := TGeneratedShadowMapResource(TTextureResources.Get(TexNode));
           if TextureRes <> nil then
           begin
+            {$ifdef REZVIVO_STARTUP_TIMING}
+            TimingStart := GetTickCount64;
+            {$endif}
             TextureRes.Update(Render, ProjectionNear, ProjectionFar,
               TAbstractPunctualLightNode(TexNode.FdLight.Value));
+            {$ifdef REZVIVO_STARTUP_TIMING}
+            if GetTickCount64 - TimingStart >= 100 then
+              WritelnLog('StartupTiming', 'shadow ms=%d name=%s',
+                [GetTickCount64 - TimingStart, TexNode.NiceName]);
+            {$endif}
 
             TexNode.GenTexFunctionality.PostUpdate;
 

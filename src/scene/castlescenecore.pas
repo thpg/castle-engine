@@ -2472,6 +2472,17 @@ var
     @exclude }
   InternalEnableAnimation: Boolean = true;
 
+  { Диагностика жизненного цикла сцен (расследование дублирования сцены
+    при повторном заезде): единая точка перехвата — TCastleSceneCore.Create /
+    LoadCore / FreeRootNode / Destroy. Пишет в <exedir>\scene_lifecycle.log,
+    независимо от CastleLog (файл перезаписывается при старте процесса). }
+  SceneLifecycleLogEnabled: Boolean = false;
+
+{ Одна строка в scene_lifecycle.log (потокобезопасно, flush каждую запись).
+  Вызывается из движка (LOAD/UNLOAD/FREE/CREATE) и из прикладного кода
+  (сборка/освобождение составных сцен — райдер, маркеры view). }
+procedure SceneLifecycleLog(const AMsg: String);
+
 implementation
 
 uses Math, DateUtils,
@@ -2481,6 +2492,87 @@ uses Math, DateUtils,
 {$define read_implementation}
 {$I castlescenecore_collisions.inc}
 {$undef read_implementation}
+
+{ SceneLifecycleLog ------------------------------------------------------ }
+
+var
+  SLLock: TRTLCriticalSection;
+  SLFileName: String = '';
+  SLSessionStarted: Boolean = false;
+
+procedure SceneLifecycleLog(const AMsg: String);
+var
+  F: TextFile;
+begin
+  if not SceneLifecycleLogEnabled then Exit;
+  EnterCriticalSection(SLLock);
+  try
+    try
+      if SLFileName = '' then
+        SLFileName := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)))
+          + 'scene_lifecycle.log';
+      AssignFile(F, SLFileName);
+      if not SLSessionStarted then
+      begin
+        { Накопление ПО ВСЕМ запускам игры: файл дополняется, каждый
+          запуск открывается заголовком === LAUNCH ===. Анализатор баланса
+          (analyze_balance.py) режет файл на запуски по этим заголовкам. }
+        if FileExists(SLFileName) then
+          Append(F)
+        else
+          Rewrite(F);
+        WriteLn(F, FormatDateTime('yyyy"-"mm"-"dd', Now));
+        SLSessionStarted := true;
+      end else
+        Append(F);
+      WriteLn(F, FormatDateTime('hh":"nn":"ss"."zzz', Now)
+        + ' [t=' + IntToStr(PtrInt(GetThreadID)) + '] ' + AMsg);
+      CloseFile(F);
+    except
+      { лог никогда не должен ронять приложение }
+    end;
+  finally
+    LeaveCriticalSection(SLLock);
+  end;
+end;
+
+function SLOwnerChain(C: TComponent): String;
+begin
+  Result := '';
+  while (C <> nil) and (C.Owner <> nil) do
+  begin
+    C := C.Owner;
+    Result := '/' + C.Name + '(' + C.ClassName + ')' + Result;
+  end;
+  if Result = '' then Result := '-';
+end;
+
+function SLRootKids(S: TCastleSceneCore): Integer;
+begin
+  if (S <> nil) and (S.RootNode <> nil) then
+    Result := S.RootNode.FdChildren.Count
+  else
+    Result := -1;
+end;
+
+function SLSceneInfo(S: TCastleSceneCore): String;
+var
+  W: String;
+begin
+  try
+    if S.HasWorldTransform then
+      W := Format('%.1f,%.1f,%.1f', [S.WorldTransform[3, 0],
+        S.WorldTransform[3, 1], S.WorldTransform[3, 2]])
+    else
+      W := '-';
+  except
+    W := 'err';
+  end;
+  Result := Format('%s($%p) Name="%s" Url="%s" T=(%.2f,%.2f,%.2f) W=(%s) RootKids=%d Owner=%s',
+    [S.ClassName, Pointer(S), S.Name, S.Url,
+     S.Translation.X, S.Translation.Y, S.Translation.Z, W,
+     SLRootKids(S), SLOwnerChain(S)]);
+end;
 
 { TX3DBindableStack ----------------------------------------------------- }
 
@@ -3149,6 +3241,9 @@ begin
   FUrlMonitoring.Init({$ifdef FPC}@{$endif} ReloadUrl);
 
   UpdateSpatial;
+
+  if SceneLifecycleLogEnabled then
+    SceneLifecycleLog('CREATE ' + SLSceneInfo(Self));
 end;
 
 procedure TCastleSceneCore.BeforeDestruction;
@@ -3165,6 +3260,8 @@ end;
 
 destructor TCastleSceneCore.Destroy;
 begin
+  if SceneLifecycleLogEnabled then
+    SceneLifecycleLog('FREE  ' + SLSceneInfo(Self));
   FreeAndNil(FExposeTransforms);
   FreeAndNil(FExposedTransforms);
   FreeAndNil(ScheduledSkinUpdates);
@@ -3202,6 +3299,10 @@ end;
 
 procedure TCastleSceneCore.FreeRootNode;
 begin
+  if SceneLifecycleLogEnabled and (FRootNode <> nil) then
+    SceneLifecycleLog(Format('UNLOAD %s($%p) Name="%s" Url="%s" RootKids=%d Owns=%s',
+      [ClassName, Pointer(Self), Name, FUrl, SLRootKids(Self),
+       BoolToStr(FOwnsRootNode, True)]));
   { These must be done always before freeing }
   BeforeNodesFree;
   PointingDeviceClear;
@@ -3300,6 +3401,9 @@ begin
   ProcessEvents := RestoreProcessEvents;
 
   UpdateAutoAnimation(false);
+
+  if SceneLifecycleLogEnabled then
+    SceneLifecycleLog('LOAD  ' + SLSceneInfo(Self));
 end;
 
 procedure TCastleSceneCore.Load(const AUrl: String; const AllowStdIn: boolean;
@@ -4275,6 +4379,11 @@ begin
     FreeAndNil(FShapes);
     FShapes := TShapeTreeGroup.Create(Self);
     ShapeLODs.Clear;
+    { The shape tree above owned all TShapeTreeTransform wrappers;
+      TransformationDirty must not keep dangling pointers to them
+      (BeforeNodesFree already does this, ChangedAll missed it ->
+      EArgumentOutOfRangeException in the next FinishTransformationChanges). }
+    TransformationDirty.Clear;
     InternalGlobalLights.Clear;
     FViewpointsArray.Clear;
     FAnimationsList.Clear;
@@ -4446,6 +4555,17 @@ begin
   for I := 0 to C - 1 do
   begin
     TransformShapeTree := TShapeTreeTransform(TShapeTree.AssociatedShape(TransformNode, I));
+    { When the same X3D node graph is shared by multiple TCastleScene
+      instances (e.g. a rider subtree mounted into the bike's unified scene
+      while remaining the root of its own scene), the node association list
+      contains TShapeTreeTransform wrappers from ALL those scenes.
+      Adding another scene's wrapper to our TransformationDirty makes it
+      dangle once that scene rebuilds its shape tree -> crash in
+      FinishTransformationChanges. Process only our own wrappers
+      (ParentScene = nil is a free shape tree, keep it, as before). }
+    if (TransformShapeTree.ParentScene <> nil) and
+       (TransformShapeTree.ParentScene <> Self) then
+      Continue;
     TransformationChangedUpdateSkin(TransformNode, TransformShapeTree.TransformState);
     TransformShapeTree.TransformNeedsUpdate := true;
     AddTransformationDirty(TransformShapeTree);
@@ -6515,7 +6635,7 @@ procedure TCastleSceneCore.FinishTransformationChanges;
   begin
     // process ScheduledSkinUpdates
     for I := 0 to ScheduledSkinUpdates.Count - 1 do
-      (ScheduledSkinUpdates.Items[I] as TSkinNode).InternalUpdateSkin;
+      (ScheduledSkinUpdates.Items[I] as TSkinNode).InternalUpdateSkin(Self);
     ScheduledSkinUpdates.Count := 0;
     // process ScheduledHumanoidSkinUpdates
     for I := 0 to ScheduledHumanoidSkinUpdates.Count - 1 do
@@ -6528,19 +6648,40 @@ var
   DepthList: TShapeTreeTransformList;
   TransformShapeTree: TShapeTreeTransform;
   VisibleChange, AnyChange: Boolean;
+  Snapshot: TShapeTreeTransformList;
+  Depth: Integer;
 begin
   VisibleChange := false;
   AnyChange := false;
 
-  for DepthList in TransformationDirty do
+  { Re-entrancy-safe processing: FastTransformUpdate (esp. on skinned
+    skeletons) may fire further transformation changes, calling
+    AddTransformationDirty while we iterate. That would reallocate the
+    per-depth lists (or append to the list being enumerated) and corrupt
+    the enumeration -> EArgumentOutOfRangeException in DoRemove.
+    So: index-based loop over the outer list (immune to its reallocation),
+    and for each depth iterate a snapshot after clearing the shared list;
+    wrappers dirtied re-entrantly are picked up on the next frame. }
+  Depth := 0;
+  while Depth < TransformationDirty.Count do
   begin
+    DepthList := TransformationDirty[Depth];
     if DepthList <> nil then
     begin
-      AnyChange := AnyChange or (DepthList.Count <> 0);
-      for TransformShapeTree in DepthList do
-        TransformShapeTree.FastTransformUpdate(VisibleChange);
-      DepthList.Clear;
+      if DepthList.Count <> 0 then
+      begin
+        AnyChange := true;
+        Snapshot := TShapeTreeTransformList.Create(false);
+        try
+          for TransformShapeTree in DepthList do
+            Snapshot.Add(TransformShapeTree);
+          DepthList.Clear;
+          for TransformShapeTree in Snapshot do
+            TransformShapeTree.FastTransformUpdate(VisibleChange);
+        finally FreeAndNil(Snapshot) end;
+      end;
     end;
+    Inc(Depth);
   end;
 
   if AnyChange then
@@ -8570,5 +8711,10 @@ begin
   end else
     Result := InlineNode;
 end;
+
+initialization
+  InitCriticalSection(SLLock);
+finalization
+  DoneCriticalSection(SLLock);
 
 end.

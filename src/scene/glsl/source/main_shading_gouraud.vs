@@ -8,6 +8,17 @@
 uniform mat4 castle_ModelViewMatrix;
 uniform mat4 castle_ProjectionMatrix;
 attribute vec4 castle_Vertex;
+#ifdef CASTLE_CACHE_DEFORMATION
+uniform int castle_DeformationMode; // 0: original, 1: capture, 2: ready mesh
+varying vec3 castle_CachedPosition;
+varying vec3 castle_CachedNormal;
+varying vec4 castle_CachedTangent;
+mat4 skinMatrix;
+#ifdef CASTLE_CACHE_DEFORMATION_TANGENTS
+attribute vec4 castle_Tangent;
+#endif
+#endif
+
 
 #if defined(CASTLE_HAS_NORMALS)
 uniform mat3 castle_NormalMatrix;
@@ -74,8 +85,30 @@ void main(void)
     vec3(0.0, 0.0, 1.0);
     #endif
 
+  #ifdef CASTLE_CACHE_DEFORMATION
+  if (castle_DeformationMode != 2) {
+  #endif
   /* PLUG: vertex_object_space_change (vertex_object, normal_object) */
   /* PLUG: vertex_object_space (vertex_object, normal_object) */
+  #ifdef CASTLE_CACHE_DEFORMATION
+  } else {
+    // Cached tangents have already received the native skin transform.
+    skinMatrix = mat4(1.0);
+  }
+  castle_CachedPosition = vertex_object.xyz;
+  castle_CachedNormal = normal_object;
+  vec4 cache_tangent = vec4(0.0, 0.0, 0.0, 1.0);
+  #ifdef CASTLE_CACHE_DEFORMATION_TANGENTS
+  cache_tangent = castle_Tangent;
+  /* PLUG: tangent_object_space (cache_tangent) */
+  #endif
+  castle_CachedTangent = cache_tangent;
+  if (castle_DeformationMode == 1) {
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+  #endif
+
 
   #ifdef CASTLE_BUGGY_GLSL_READ_VARYING
   /* use local variables, instead of reading + writing to varying variables,

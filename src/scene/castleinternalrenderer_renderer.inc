@@ -225,6 +225,8 @@
     { Constructor. }
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
+    { Release context-owned rigid shadow programs. Recreated lazily on draw. }
+    procedure GLContextClose;
 
     procedure RenderBegin(const AGlobalLights: TLightInstancesList;
       const ARenderingCamera: TRenderingCamera;
@@ -275,9 +277,14 @@ destructor TRenderer.Destroy;
 begin
   FreeAndNil(TextureTransformUnitsUsedMore);
   FreeAndNil(PreparedShader);
+  GLContextClose;
+  inherited;
+end;
+
+procedure TRenderer.GLContextClose;
+begin
   FreeAndNil(ShadowMapsShaders);
   FreeAndNil(VarianceShadowMapsShaders);
-  inherited;
 end;
 
 function TRenderer.BumpMapping(const RenderOptions: TCastleRenderOptions): TBumpMapping;
@@ -687,7 +694,10 @@ procedure TRenderer.RenderShape(const Shape: TX3DRendererShape;
 
 var
   Shader: TShader;
+  UseCoverage, RestoreCoverage: Boolean;
+  ProfileStarted: TTimerResult;
 begin
+  if ProfileSharedEffects then ProfileStarted := Timer;
   InitializeFromRenderOptions;
 
   RenderContext.DepthRange := DepthRange;
@@ -695,9 +705,24 @@ begin
   Shader := InitializeShader;
   FixedFunctionBegin(Shader.SceneModelView);
 
-  RenderShapeLineProperties(Shape, RenderOptions, Shader);
+  UseCoverage := (Shape.State.Appearance <> nil) and
+    Shape.State.Appearance.AlphaToCoverage;
+  RestoreCoverage := false;
+  if UseCoverage then
+  begin
+    RestoreCoverage := RenderContext.SampleAlphaToCoverage;
+    RenderContext.SampleAlphaToCoverage := true;
+  end;
+  try
+    RenderShapeLineProperties(Shape, RenderOptions, Shader);
+  finally
+    if UseCoverage then
+      RenderContext.SampleAlphaToCoverage := RestoreCoverage;
+  end;
 
   FixedFunctionEnd;
+  if ProfileSharedEffects then
+    RenderShapeSeconds := RenderShapeSeconds + TimerSeconds(Timer, ProfileStarted);
 end;
 
 procedure TRenderer.RenderShapeLineProperties(const Shape: TX3DRendererShape;
@@ -1553,6 +1578,22 @@ procedure TRenderer.RenderShapeInside(const Shape: TX3DRendererShape;
   const GeneratorClass: TArraysGeneratorClass;
   const ExposedMeshRenderer: TObject);
 
+  function HasVertexEffects(const Effects: TX3DNodeList): Boolean;
+  var I, J: Integer; Effect: TEffectNode;
+  begin
+    Result := False;
+    if Effects = nil then Exit;
+    for I := 0 to Effects.Count - 1 do
+      if Effects[I] is TEffectNode then
+      begin
+        Effect := TEffectNode(Effects[I]);
+        if not Effect.Enabled then Continue;
+        for J := 0 to Effect.FdParts.Count - 1 do
+          if (Effect.FdParts[J] is TEffectPartNode) and
+             (TEffectPartNode(Effect.FdParts[J]).ShaderType = stVertex) then Exit(True);
+      end;
+  end;
+
   procedure SetupShadowMapsGenerationShaders(const MeshRenderer: TMeshRenderer);
   begin
     case RenderingCamera.Target of
@@ -1571,21 +1612,18 @@ procedure TRenderer.RenderShapeInside(const Shape: TX3DRendererShape;
         end;
       rtShadowMap:
         begin
-          { Do not assign MeshRenderer.CustomShaders when we make skinned animation.
-            We need to do full shader then, to apply skinned animation on GPU,
-            and thus render animated mesh to a shadow map.
-            Test below is a subset of tests before doing Shader.EnableSkinnedAnimation
-            in TSkinnedRenderer.RenderCoordinateBegin .
-            Testcase that this is necessary:
-            https://forum.castle-engine.io/t/shadow-map-not-updating-from-an-animated-tcastlescene/2062/4 .
-
-            TODO: This could be more optimal, if we enable shadow_map_generate.vs
-            to have plugs and expose PLUG_vertex_object_space_change .
-            Then we could still have special minimal shader,
-            but doing skinned animation on GPU. }
+          { Skinning and vertex effects need their deformation plugs. The
+            general shader builder supplies an opaque depth-only variant;
+            alpha-tested or custom cutout materials keep the full program.
+            Rigid geometry can use the small shared shadow shader below. }
+          MeshRenderer.CustomShaders := nil;
           if not (
-            Shape.State.SkinnedAnimatedShape and
-            (Shape.State.Skin.InternalMeshCalculation <> mcCpu)
+            (Shape.State.SkinnedAnimatedShape and
+             (Shape.State.Skin.InternalMeshCalculation <> mcCpu)) or
+            (UseFastShadowShaders and
+             (HasVertexEffects(Shape.State.Effects) or
+              ((Shape.State.Appearance <> nil) and
+               HasVertexEffects(Shape.State.Appearance.FdEffects.InternalItems))))
           ) then
           begin
             if ShadowMapsShaders = nil then
@@ -1605,6 +1643,8 @@ procedure TRenderer.RenderShapeInside(const Shape: TX3DRendererShape;
 var
   Generator: TArraysGenerator;
   CoordinateRenderer: TBaseCoordinateRenderer;
+  PrepareTick, PrepareMs: QWord;
+  PrepareBytes: Int64;
 begin
   { No point preparing VBO for clones, clones will need own VBOs anyway. }
   if RenderMode = rmPrepareRenderClones then
@@ -1621,11 +1661,16 @@ begin
       Shape.Cache := RendererCache.Shape_IncReference(Shape, RenderOptions);
 
     { calculate Shape.Cache.Arrays }
-    if (Shape.Cache.Arrays = nil) or
+    if Shape.Cache.SurfaceQueryOnly or (Shape.Cache.Arrays = nil) or
        (Shape.Cache.VboToReload <> []) then
     begin
-      if not FastUpdateArrays(Shape) then
+      if Shape.Cache.SurfaceQueryOnly or not FastUpdateArrays(Shape) then
       begin
+        if Shape.Cache.SurfaceQueryOnly then
+          Shape.Cache.InvalidateVertexData(AllVboTypes);
+        { REZVIVO: no timers on the normal cached render path. Include the
+          generator constructor (e.g. inferred normals) in CPU preparation. }
+        PrepareTick := GetTickCount64;
         FreeAndNil(Shape.Cache.Arrays); // we just need to create new Arrays
         Generator := GeneratorClass.Create(Shape);
         try
@@ -1637,10 +1682,25 @@ begin
           Generator.ShapeBumpMappingTextureCoordinatesId := Shape.BumpMappingTextureCoordinatesId;
           Shape.Cache.Arrays := Generator.GenerateArrays;
         finally FreeAndNil(Generator) end;
+        PrepareMs := GetTickCount64 - PrepareTick;
+        PrepareBytes := Int64(Shape.Cache.Arrays.Count) *
+          (Shape.Cache.Arrays.CoordinateSize + Shape.Cache.Arrays.AttributeSize) +
+          Int64(Shape.Cache.Arrays.IndexesCount) * SizeOf(TGLIndex);
+        if PrepareMs > 100 then
+          WritelnLog('ResourcePrepare', 'stage=arrays ms=%d shape="%s" geometry=%s vertices=%d indices=%d uv=%d bump=%s bytes=%d',
+            [PrepareMs, Shape.NiceName, Shape.Geometry.X3DType,
+             Shape.Cache.Arrays.Count, Shape.Cache.Arrays.IndexesCount,
+             TexCoordsNeeded, BoolToStr(Shape.BumpMappingUsed, true), PrepareBytes]);
 
         { Always after recreating Shape.Cache.Arrays, reload Shape.Cache.Vbo contents.
           This also clears VboToReload. }
+        PrepareTick := GetTickCount64;
         Shape.LoadArraysToVbo;
+        Shape.Cache.SurfaceQueryOnly := false;
+        PrepareMs := GetTickCount64 - PrepareTick;
+        if PrepareMs > 100 then
+          WritelnLog('ResourcePrepare', 'stage=vbo_upload ms=%d shape="%s" bytes=%d',
+            [PrepareMs, Shape.NiceName, PrepareBytes]);
       end;
     end;
 
@@ -1733,14 +1793,17 @@ procedure TRenderer.UpdatePass;
     for I := 0 to Length(Digits) - 1 do
     begin
       Result := Result + Digits[I] * Multiplier;
-      Multiplier := Multiplier * Ranges[I];
+      { Ranges contains inclusive upper bounds of zero-based ranges. }
+      Multiplier := Multiplier * (Ranges[I] + 1);
     end;
   end;
 
 begin
   FPass := GetTotalPass(
-    [     FInternalPass,       FWireframePass,       FUserPass ],
-    [High(FInternalPass), High(FWireframePass), High(FUserPass)]);
+    [     FInternalPass,       FWireframePass,       FUserPass,
+      Ord(UseSeparateShadowProgramCache and (RenderingCamera <> nil) and
+          (RenderingCamera.Target in [rtShadowMap, rtVarianceShadowMap])) ],
+    [High(FInternalPass), High(FWireframePass), High(FUserPass), 1]);
 end;
 
 procedure TRenderer.SetWireframePass(const Value: TWireframeRenderingPass);

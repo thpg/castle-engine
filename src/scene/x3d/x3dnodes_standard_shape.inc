@@ -170,10 +170,16 @@
       end;
     var
       FMaterialInfo: TAppearanceFallbacktMaterialInfo;
+      FAlphaToCoverage: Boolean;
   protected
     function DirectEnumerateActive(Func: TEnumerateChildrenFunction): Pointer; override;
   public
     destructor Destroy; override;
+
+    { Runtime-only sample coverage for masked thin surfaces. The renderer scopes
+      GL_SAMPLE_ALPHA_TO_COVERAGE to this appearance; single-sample targets keep
+      their normal alpha-test fallback. Does not imply alpha blending. }
+    property AlphaToCoverage: Boolean read FAlphaToCoverage write FAlphaToCoverage;
 
     { Find a suitable CommonSurfaceShader to be used when rendering this shape,
       or @nil. This is only maintaned for backward compatibility,

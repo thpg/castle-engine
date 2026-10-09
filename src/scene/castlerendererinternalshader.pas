@@ -20,7 +20,7 @@ unit CastleRendererInternalShader;
 
 interface
 
-uses Generics.Collections, Math,
+uses Classes, Generics.Collections, Math,
   CastleVectors, CastleGLShaders, CastleColors,
   X3DTime, X3DFields, X3DNodes, CastleUtils, CastleBoxes,
   CastleRendererInternalTextureEnv, CastleStringUtils, CastleRenderOptions,
@@ -55,6 +55,7 @@ type
     { Uniforms initialized after linking.
       Initializing them only once after linking allows the mesh renderer to go fast. }
     UniformCastle_ModelViewMatrix,
+    UniformCastle_ModelMatrix,
     UniformCastle_ProjectionMatrix,
     UniformCastle_NormalMatrix,
     UniformCastle_MaterialDiffuseAlpha,
@@ -97,6 +98,19 @@ type
     and to observe VRML/X3D events and automatically update uniform values.
     Also allows to initialize and check program by TShader.LinkProgram,
     and get a hash of it by TShader.CodeHash. }
+  TSharedEffectBinding = record
+    DeclarationIndex: Integer;
+    Uniform: TGLSLUniform;
+    CachedValue: TX3DField; { owned by the program, not the source scene }
+    Initialized: Boolean;
+  end;
+  TSharedEffectBindings = class
+    Items: array of TSharedEffectBinding;
+    LastValuesSerial: Int64;
+    LastFrame, LastMutation: QWord;
+    HasTextures: Boolean;
+  end;
+
   TX3DShaderProgram = class(TX3DShaderProgramBase)
   private
     { Events where we registered our EventReceive method. }
@@ -104,6 +118,13 @@ type
 
     { Current state of lights uniforms for this shader. }
     FLightUniformsList: TLightUniformsList;
+    { Value copies, never scene/field pointers: safe after an instance is freed. }
+    SharedUniformValues: TStringList;
+    SharedEffectLayouts: TStringList;
+    SharedValuesMutation: QWord;
+    procedure ApplySharedEffectCached(const Node: TEffectNode);
+    procedure ApplySharedEffect(const Node: TX3DNode);
+    procedure ApplySharedEffects(const Nodes: TMFNode);
 
     { Set uniform variable from VRML/X3D field value.
       Uniform name is contained in UniformName. UniformValue indicates
@@ -130,6 +151,8 @@ type
       const AUniformMissing: TUniformMissing;
       const EnableDisable: boolean);
 
+    procedure SetUniformFromFieldAt(const U:TGLSLUniform; const UniformValue:TX3DField);
+
     procedure EventReceive(const Event: TX3DEvent; const Value: TX3DField;
       const Time: TX3DTime);
 
@@ -143,7 +166,11 @@ type
   protected
     { Nodes that have interface declarations with textures for this shader. }
     UniformsTextures: TX3DFieldList;
+    SharedUniformsTextures: TX3DFieldList;
   public
+    { Depth variants only observe uniforms that survived shader linking. }
+    ActiveUniformsOnly: Boolean;
+    CachedDeformation: Boolean;
     constructor Create;
     destructor Destroy; override;
 
@@ -314,6 +341,8 @@ type
     FPhongShading: boolean;
     FLightingModel: TLightingModel;
     FAlphaTest: Boolean;
+    FDepthOnly: Boolean;
+    FCacheDeformation, FCacheDeformationTangents: Boolean;
     UsesShadowMaps: Boolean;
 
     { We have to optimize the most often case of TShader usage,
@@ -625,6 +654,9 @@ type
 
     { Is alpha testing enabled by EnableAlphaTest. }
     property AlphaTest: Boolean read FAlphaTest;
+    property DepthOnly: Boolean read FDepthOnly write FDepthOnly;
+    property CacheDeformation: Boolean read FCacheDeformation write FCacheDeformation;
+    property CacheDeformationTangents: Boolean read FCacheDeformationTangents write FCacheDeformationTangents;
 
     { Enable doing skinned animation on GPU.
       Give the jointMatrix uniform value. }
@@ -648,14 +680,37 @@ function UniformMissingFromNode(const Node: TX3DNode): TUniformMissing;
 function FindPlugName(const PlugValue: String;
   out DeclaredParameters: String): String;
 
+{ Exact numeric uniform-cache comparison; FastEqualsValue deliberately gives
+  up for multi-valued fields, including unchanged skeleton/pose arrays. }
+function SharedUniformValuesEqual(const A, B: TX3DField): Boolean;
+
+var
+  UseFastShadowShaders: Boolean = True;
+  UseSeparateShadowProgramCache: Boolean = True;
+  UseCachedRiderMeshes: Boolean = True;
+  UseDelayedRiderMeshes: Boolean = False;
+  UseSharedUniformArrayCache: Boolean = True;
+  UseSharedEffectBindings: Boolean = True;
+  UseSharedEffectRevisionCache: Boolean = True;
+  CachedMeshCaptures, CachedMeshDraws: QWord;
+  ProfileSharedEffects: Boolean = False;
+  SharedEffectCalls, SharedEffectFields, SharedEffectUploads: QWord;
+  SharedEffectSeconds, DynamicUniformSeconds: Double;
+  RenderShapeSeconds, MeshBeginSeconds, MeshAttributesSeconds,
+    MeshPoseSeconds, MeshDrawSeconds, MeshEndSeconds,
+    MeshShaderSeconds, MeshTextureSeconds: Double;
+  NativeSkinUniformSeconds, LightUniformSeconds, OtherUniformSeconds,
+    SharedUploadSeconds: Double;
+
 {$undef read_interface}
 
 implementation
 
-uses SysUtils, StrUtils,
+uses SysUtils, StrUtils, CastleTimeUtils,
   {$ifdef OpenGLES} CastleGLES, {$else} CastleGL, {$endif}
   CastleGLUtils, CastleLog, CastleGLVersion, CastleInternalScreenEffects,
-  CastleScreenEffects, CastleInternalX3DLexer, CastleInternalGLUtils;
+  CastleScreenEffects, CastleInternalX3DLexer, CastleInternalGLUtils
+  {$if defined(FPC) and not defined(OpenGLES)}, MD5{$endif};
 
 {$define read_implementation}
 {$I castlerendererinternalshader_hash.inc}
@@ -869,6 +924,7 @@ begin
   inherited;
 
   UniformCastle_ModelViewMatrix       := Uniform('castle_ModelViewMatrix'      , umIgnore);
+  UniformCastle_ModelMatrix           := Uniform('castle_ModelMatrix'          , umIgnore);
   UniformCastle_ProjectionMatrix      := Uniform('castle_ProjectionMatrix'     , umIgnore);
   UniformCastle_NormalMatrix          := Uniform('castle_NormalMatrix'         , umIgnore);
   UniformCastle_MaterialDiffuseAlpha  := Uniform('castle_MaterialDiffuseAlpha' , umIgnore);
@@ -899,6 +955,15 @@ begin
   inherited;
   EventsObserved := TX3DEventList.Create(false);
   UniformsTextures := TX3DFieldList.Create(false);
+  SharedUniformsTextures := TX3DFieldList.Create(false);
+  SharedUniformValues := TStringList.Create;
+  SharedUniformValues.CaseSensitive := True;
+  ConfigureShaderNameList(SharedUniformValues);
+  SharedUniformValues.Sorted := True;
+  SharedEffectLayouts := TStringList.Create;
+  SharedEffectLayouts.CaseSensitive := True;
+  ConfigureShaderNameList(SharedEffectLayouts);
+  SharedEffectLayouts.Sorted := True;
   FLightUniformsList := TLightUniformsList.Create(true);
 end;
 
@@ -913,6 +978,13 @@ begin
     FreeAndNil(EventsObserved);
   end;
   FreeAndNil(UniformsTextures);
+  FreeAndNil(SharedUniformsTextures);
+  for I := 0 to SharedEffectLayouts.Count - 1 do
+    SharedEffectLayouts.Objects[I].Free;
+  FreeAndNil(SharedEffectLayouts);
+  for I := 0 to SharedUniformValues.Count - 1 do
+    SharedUniformValues.Objects[I].Free;
+  FreeAndNil(SharedUniformValues);
   FreeAndNil(FLightUniformsList);
   inherited;
 end;
@@ -956,8 +1028,15 @@ end;
 
 procedure TX3DShaderProgram.SetUniformFromField(
   const UniformName: String; const UniformValue: TX3DField;
-  const AUniformMissing: TUniformMissing;
-  const EnableDisable: Boolean);
+  const AUniformMissing: TUniformMissing; const EnableDisable: Boolean);
+begin
+  if EnableDisable then Enable;
+  SetUniformFromFieldAt(Uniform(UniformName,AUniformMissing),UniformValue);
+  if EnableDisable then Disable;
+end;
+
+procedure TX3DShaderProgram.SetUniformFromFieldAt(const U:TGLSLUniform;
+  const UniformValue:TX3DField);
 var
   TempF: TSingleList;
   TempVec2f: TVector2List;
@@ -966,17 +1045,15 @@ var
   TempMat3f: TMatrix3List;
   TempMat4f: TMatrix4List;
 begin
-  { program must be active to set uniform values. }
-  if EnableDisable then
-    Enable;
+  if U.Location<0 then Exit;
 
   if UniformValue is TSFBool then
-    SetUniform(UniformName, TSFBool(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFBool(UniformValue).Value) else
   if UniformValue is TSFLong then
     { Handling of SFLong also takes care of SFInt32. }
-    SetUniform(UniformName, TSFLong(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFLong(UniformValue).Value) else
   if UniformValue is TSFVec2f then
-    SetUniform(UniformName, TSFVec2f(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFVec2f(UniformValue).Value) else
 
   (*
   { Old approach: Check TSFColor first, otherwise TSFVec3f would also catch and handle
@@ -988,24 +1065,24 @@ begin
     We now pass SFColor as vec3, it can fallback TSFVec3f clause. }
 
   // if UniformValue is TSFColor then
-  //   SetUniform(UniformName, Vector4(TSFColor(UniformValue).Value, 1.0), AUniformMissing) else
+  //   U.SetValue(Vector4(TSFColor(UniformValue).Value, 1.0)) else
   *)
 
   if UniformValue is TSFVec3f then
-    SetUniform(UniformName, TSFVec3f(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFVec3f(UniformValue).Value) else
   if UniformValue is TSFVec4f then
-    SetUniform(UniformName, TSFVec4f(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFVec4f(UniformValue).Value) else
   if UniformValue is TSFRotation then
-    SetUniform(UniformName, TSFRotation(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFRotation(UniformValue).Value) else
   if UniformValue is TSFMatrix3f then
-    SetUniform(UniformName, TSFMatrix3f(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFMatrix3f(UniformValue).Value) else
   if UniformValue is TSFMatrix4f then
-    SetUniform(UniformName, TSFMatrix4f(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFMatrix4f(UniformValue).Value) else
   if UniformValue is TSFFloat then
-    SetUniform(UniformName, TSFFloat(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFFloat(UniformValue).Value) else
   if UniformValue is TSFDouble then
     { SFDouble also takes care of SFTime }
-    SetUniform(UniformName, TSFDouble(UniformValue).Value, AUniformMissing) else
+    U.SetValue(TSFDouble(UniformValue).Value) else
 
   { Double-precision vector and matrix types.
 
@@ -1018,23 +1095,23 @@ begin
     the reasonable approach: support all double-precision vectors and matrices,
     just like single-precision. }
   if UniformValue is TSFVec2d then
-    SetUniform(UniformName, Vector2(TSFVec2d(UniformValue).Value), AUniformMissing) else
+    U.SetValue(Vector2(TSFVec2d(UniformValue).Value)) else
   if UniformValue is TSFVec3d then
-    SetUniform(UniformName, Vector3(TSFVec3d(UniformValue).Value), AUniformMissing) else
+    U.SetValue(Vector3(TSFVec3d(UniformValue).Value)) else
   if UniformValue is TSFVec4d then
-    SetUniform(UniformName, Vector4(TSFVec4d(UniformValue).Value), AUniformMissing) else
+    U.SetValue(Vector4(TSFVec4d(UniformValue).Value)) else
   if UniformValue is TSFMatrix3d then
-    SetUniform(UniformName, Matrix3(TSFMatrix3d(UniformValue).Value), AUniformMissing) else
+    U.SetValue(Matrix3(TSFMatrix3d(UniformValue).Value)) else
   if UniformValue is TSFMatrix4d then
-    SetUniform(UniformName, Matrix4(TSFMatrix4d(UniformValue).Value), AUniformMissing) else
+    U.SetValue(Matrix4(TSFMatrix4d(UniformValue).Value)) else
 
   { Now repeat this for array types }
   if UniformValue is TMFBool then
-    SetUniform(UniformName, TMFBool(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFBool(UniformValue).Items) else
   if UniformValue is TMFLong then
-    SetUniform(UniformName, TMFLong(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFLong(UniformValue).Items) else
   if UniformValue is TMFVec2f then
-    SetUniform(UniformName, TMFVec2f(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFVec2f(UniformValue).Items) else
   (* Old approach: follow X3D spec, and map MFColor to vec4[].
      New approach: ignore nonsense X3D spec, and map MFColor to vec3[].
      Just allow TMFColor to fallback to TMFVec3f.
@@ -1042,62 +1119,62 @@ begin
   begin
     TempVec4f := TMFColor(UniformValue).Items.ToVector4(1.0);
     try
-      SetUniform(UniformName, TempVec4f, AUniformMissing);
+      U.SetValue(TempVec4f);
     finally FreeAndNil(TempVec4f) end;
   end else
   *)
   if UniformValue is TMFVec3f then
-    SetUniform(UniformName, TMFVec3f(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFVec3f(UniformValue).Items) else
   if UniformValue is TMFVec4f then
-    SetUniform(UniformName, TMFVec4f(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFVec4f(UniformValue).Items) else
   if UniformValue is TMFRotation then
-    SetUniform(UniformName, TMFRotation(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFRotation(UniformValue).Items) else
   if UniformValue is TMFMatrix3f then
-    SetUniform(UniformName, TMFMatrix3f(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFMatrix3f(UniformValue).Items) else
   if UniformValue is TMFMatrix4f then
-    SetUniform(UniformName, TMFMatrix4f(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFMatrix4f(UniformValue).Items) else
   if UniformValue is TMFFloat then
-    SetUniform(UniformName, TMFFloat(UniformValue).Items, AUniformMissing) else
+    U.SetValue(TMFFloat(UniformValue).Items) else
   if UniformValue is TMFDouble then
   begin
     TempF := TMFDouble(UniformValue).Items.ToSingle;
     try
-      SetUniform(UniformName, TempF, AUniformMissing);
+      U.SetValue(TempF);
     finally FreeAndNil(TempF) end;
   end else
   if UniformValue is TMFVec2d then
   begin
     TempVec2f := TMFVec2d(UniformValue).Items.ToVector2;
     try
-      SetUniform(UniformName, TempVec2f, AUniformMissing);
+      U.SetValue(TempVec2f);
     finally FreeAndNil(TempVec2f) end;
   end else
   if UniformValue is TMFVec3d then
   begin
     TempVec3f := TMFVec3d(UniformValue).Items.ToVector3;
     try
-      SetUniform(UniformName, TempVec3f, AUniformMissing);
+      U.SetValue(TempVec3f);
     finally FreeAndNil(TempVec3f) end;
   end else
   if UniformValue is TMFVec4d then
   begin
     TempVec4f := TMFVec4d(UniformValue).Items.ToVector4;
     try
-      SetUniform(UniformName, TempVec4f, AUniformMissing);
+      U.SetValue(TempVec4f);
     finally FreeAndNil(TempVec4f) end;
   end else
   if UniformValue is TMFMatrix3d then
   begin
     TempMat3f := TMFMatrix3d(UniformValue).Items.ToMatrix3;
     try
-      SetUniform(UniformName, TempMat3f, AUniformMissing);
+      U.SetValue(TempMat3f);
     finally FreeAndNil(TempMat3f) end;
   end else
   if UniformValue is TMFMatrix4d then
   begin
     TempMat4f := TMFMatrix4d(UniformValue).Items.ToMatrix4;
     try
-      SetUniform(UniformName, TempMat4f, AUniformMissing);
+      U.SetValue(TempMat4f);
     finally FreeAndNil(TempMat4f) end;
   end else
 
@@ -1116,9 +1193,7 @@ begin
       SF/MFImage }
     WritelnWarning('Shader', 'Setting uniform GLSL variable from X3D field type "' + UniformValue.X3DType + '" not supported');
 
-  if EnableDisable then
-    { TODO: this should restore previously bound program }
-    Disable;
+
 end;
 
 procedure TX3DShaderProgram.EventReceive(
@@ -1154,11 +1229,15 @@ var
   I: Integer;
   IDecl: TX3DInterfaceDeclaration;
 begin
+  if (Node is TEffectNode) and
+     (TEffectNode(Node).InternalSharedCodeKey <> '') then Exit;
   Assert(Node.HasInterfaceDeclarations <> []);
   Assert(Node.InterfaceDeclarations <> nil);
   for I := 0 to Node.InterfaceDeclarations.Count - 1 do
   begin
     IDecl := Node.InterfaceDeclarations[I];
+    if ActiveUniformsOnly and
+       (Uniform(IDecl.FieldOrEvent.X3DName, umIgnore).Location < 0) then Continue;
     if (IDecl.Field <> nil) and
        ((IDecl.Field is TSFNode) or
         (IDecl.Field is TMFNode)) then
@@ -1175,6 +1254,168 @@ var
 begin
   for I := 0 to Nodes.Count - 1 do
     BindUniforms(Nodes[I], EnableDisable);
+end;
+
+function SharedUniformValuesEqual(const A, B: TX3DField): Boolean;
+  function SameBytes(const PA, PB: Pointer; const NA, NB, ItemSize: SizeInt): Boolean;
+  begin
+    if NA<>NB then Exit(False);
+    if NA=0 then Exit(True);
+    Result:=CompareMem(PA,PB,NA*ItemSize);
+  end;
+begin
+  if (A=nil) or (B=nil) then Exit(A=B);
+  if A.ClassType<>B.ClassType then Exit(False);
+  if A.FastEqualsValue(B) then Exit(True);
+  if A is TMFFloat then
+    Exit(SameBytes(TMFFloat(A).Items.L,TMFFloat(B).Items.L,
+      TMFFloat(A).Items.Count,TMFFloat(B).Items.Count,SizeOf(Single)));
+  if A is TMFLong then
+    Exit(SameBytes(TMFLong(A).Items.L,TMFLong(B).Items.L,
+      TMFLong(A).Items.Count,TMFLong(B).Items.Count,SizeOf(Int32)));
+  if A is TMFBool then
+    Exit(SameBytes(TMFBool(A).Items.L,TMFBool(B).Items.L,
+      TMFBool(A).Items.Count,TMFBool(B).Items.Count,SizeOf(Boolean)));
+  if A is TMFVec2f then
+    Exit(SameBytes(TMFVec2f(A).Items.L,TMFVec2f(B).Items.L,
+      TMFVec2f(A).Items.Count,TMFVec2f(B).Items.Count,SizeOf(TVector2)));
+  if A is TMFVec3f then
+    Exit(SameBytes(TMFVec3f(A).Items.L,TMFVec3f(B).Items.L,
+      TMFVec3f(A).Items.Count,TMFVec3f(B).Items.Count,SizeOf(TVector3)));
+  if A is TMFVec4f then
+    Exit(SameBytes(TMFVec4f(A).Items.L,TMFVec4f(B).Items.L,
+      TMFVec4f(A).Items.Count,TMFVec4f(B).Items.Count,SizeOf(TVector4)));
+  if A is TMFRotation then
+    Exit(SameBytes(TMFRotation(A).Items.L,TMFRotation(B).Items.L,
+      TMFRotation(A).Items.Count,TMFRotation(B).Items.Count,SizeOf(TVector4)));
+  if A is TMFMatrix3f then
+    Exit(SameBytes(TMFMatrix3f(A).Items.L,TMFMatrix3f(B).Items.L,
+      TMFMatrix3f(A).Items.Count,TMFMatrix3f(B).Items.Count,SizeOf(TMatrix3)));
+  if A is TMFMatrix4f then
+    Exit(SameBytes(TMFMatrix4f(A).Items.L,TMFMatrix4f(B).Items.L,
+      TMFMatrix4f(A).Items.Count,TMFMatrix4f(B).Items.Count,SizeOf(TMatrix4)));
+  Result:=False;
+end;
+
+procedure TX3DShaderProgram.ApplySharedEffectCached(const Node:TEffectNode);
+var Layout:TSharedEffectBindings;I,J,N:Integer;Field:TX3DField;U:TGLSLUniform;
+  SkipValues:Boolean;
+  Started: TTimerResult;
+begin
+  { The opt-in key fingerprints immutable source and field declarations.
+    Keep only declaration indices and copies owned by this GL program:
+    no dangling node/field pointers when a bot or its scene is unloaded. }
+  ConfigureShaderNameList(SharedEffectLayouts);
+  ConfigureShaderNameList(SharedUniformValues);
+  I:=SharedEffectLayouts.IndexOf(Node.InternalSharedCodeKey);
+  if I>=0 then Layout:=TSharedEffectBindings(SharedEffectLayouts.Objects[I])
+  else begin
+    Layout:=TSharedEffectBindings.Create;
+    try
+      SetLength(Layout.Items,Node.InterfaceDeclarations.Count);N:=0;
+      for I:=0 to Node.InterfaceDeclarations.Count-1 do begin
+        Field:=Node.InterfaceDeclarations[I].Field;
+        if Field=nil then Continue;
+        U:=Uniform(Field.X3DName,umIgnore);
+        if U.Location<0 then Continue;
+        Layout.Items[N].DeclarationIndex:=I;
+        Layout.Items[N].Uniform:=U;
+        if not((Field is TSFNode)or(Field is TMFNode))then begin
+          J:=SharedUniformValues.IndexOf(Field.X3DName);
+          if J<0 then J:=SharedUniformValues.AddObject(Field.X3DName,
+            TX3DFieldClass(Field.ClassType).CreateUndefined(nil,False,Field.X3DName));
+          Layout.Items[N].CachedValue:=TX3DField(SharedUniformValues.Objects[J]);
+        end else Layout.HasTextures:=True;
+        Inc(N);
+      end;
+      SetLength(Layout.Items,N);
+      SharedEffectLayouts.AddObject(Node.InternalSharedCodeKey,Layout);
+    except Layout.Free;raise end;
+  end;
+  SkipValues:=UseSharedEffectRevisionCache and Node.InternalSharedRevisionCache and
+    (Layout.LastValuesSerial=Node.InternalSharedValuesSerial) and
+    (Layout.LastFrame=TFramesPerSecond.FrameId) and
+    (Layout.LastMutation=SharedValuesMutation);
+  if SkipValues and not Layout.HasTextures then Exit;
+  for I:=0 to High(Layout.Items)do begin
+    if SkipValues and (Layout.Items[I].CachedValue<>nil) then Continue;
+    if ProfileSharedEffects then Inc(SharedEffectFields);
+    Field:=Node.InterfaceDeclarations[Layout.Items[I].DeclarationIndex].Field;
+    if Layout.Items[I].CachedValue=nil then begin
+      if SharedUniformsTextures.IndexOf(Field)<0 then SharedUniformsTextures.Add(Field);
+      Continue;
+    end;
+    if Layout.Items[I].Initialized then begin
+      if UseSharedUniformArrayCache then begin
+        if SharedUniformValuesEqual(Layout.Items[I].CachedValue,Field)then Continue;
+      end else if Layout.Items[I].CachedValue.FastEqualsValue(Field)then Continue;
+    end;
+    if ProfileSharedEffects then Inc(SharedEffectUploads);
+    if ProfileSharedEffects then Started := Timer;
+    SetUniformFromFieldAt(Layout.Items[I].Uniform,Field);
+    Inc(SharedValuesMutation);
+    Layout.Items[I].CachedValue.AssignValue(Field);
+    if ProfileSharedEffects then
+      SharedUploadSeconds := SharedUploadSeconds + TimerSeconds(Timer, Started);
+    Layout.Items[I].Initialized:=True;
+  end;
+  Layout.LastValuesSerial:=Node.InternalSharedValuesSerial;
+  Layout.LastFrame:=TFramesPerSecond.FrameId;
+  Layout.LastMutation:=SharedValuesMutation;
+end;
+
+procedure TX3DShaderProgram.ApplySharedEffect(const Node: TX3DNode);
+var I, Index: Integer; Field, Cached: TX3DField; Key: String; Started: TTimerResult;
+begin
+  if not (Node is TEffectNode) or
+     (TEffectNode(Node).InternalSharedCodeKey = '') or
+     not TEffectNode(Node).Enabled or (Node.InterfaceDeclarations = nil) then Exit;
+  if ProfileSharedEffects then begin Started:=Timer; Inc(SharedEffectCalls) end;
+  try
+  if UseSharedEffectBindings then begin
+    ApplySharedEffectCached(TEffectNode(Node));
+    Exit;
+  end;
+  ConfigureShaderNameList(SharedUniformValues);
+  for I := 0 to Node.InterfaceDeclarations.Count - 1 do
+  begin
+    if ProfileSharedEffects then Inc(SharedEffectFields);
+    Field := Node.InterfaceDeclarations[I].Field;
+    if Field = nil then Continue;
+    Key := Field.X3DName;
+    if Uniform(Key, umIgnore).Location < 0 then Continue;
+    if (Field is TSFNode) or (Field is TMFNode) then
+    begin
+      if SharedUniformsTextures.IndexOf(Field) < 0 then SharedUniformsTextures.Add(Field);
+      Continue;
+    end;
+    Index := SharedUniformValues.IndexOf(Key);
+    if Index >= 0 then
+    begin
+      Cached := TX3DField(SharedUniformValues.Objects[Index]);
+      if UseSharedUniformArrayCache then begin
+        if SharedUniformValuesEqual(Cached,Field) then Continue;
+      end else if Cached.FastEqualsValue(Field) then Continue;
+    end else begin
+      Cached := TX3DFieldClass(Field.ClassType).CreateUndefined(nil, False, Key);
+      SharedUniformValues.AddObject(Key, Cached);
+    end;
+    Enable;
+    if ProfileSharedEffects then Inc(SharedEffectUploads);
+    SetUniformFromField(Key, Field, umIgnore, False);
+    Inc(SharedValuesMutation);
+    Cached.AssignValue(Field);
+  end;
+  finally
+    if ProfileSharedEffects then SharedEffectSeconds:=SharedEffectSeconds+TimerSeconds(Timer,Started);
+  end;
+end;
+
+procedure TX3DShaderProgram.ApplySharedEffects(const Nodes: TMFNode);
+var I: Integer;
+begin
+  if Nodes <> nil then
+    for I := 0 to Nodes.Count - 1 do ApplySharedEffect(Nodes[I]);
 end;
 
 { TDynamicUniformSingle ------------------------------------------------------ }
@@ -1336,6 +1577,9 @@ begin
   MultiTextureColor := White;
   SkinJointTextureUnit := -1;
   FAlphaTest := false;
+  FDepthOnly := false;
+  FCacheDeformation := false;
+  FCacheDeformationTangents := false;
   UsesShadowMaps := false;
 end;
 
@@ -1551,6 +1795,11 @@ procedure TShader.EffectsGenerateCode(Effects: TX3DNodeList;
       Contents: String;
     begin
       Contents := Part.Contents;
+      { A custom cutout or depth-writing fragment effect affects the shadow
+        silhouette. Decide only while linking, and retain its full program. }
+      if FDepthOnly and (Part.ShaderType = stFragment) and
+         ((Pos('discard', Contents) <> 0) or
+          (Pos('gl_FragDepth', Contents) <> 0)) then FDepthOnly := False;
       if Contents <> '' then
       begin
         Plug(Part.ShaderType, Contents, Code, ForwardDeclareInFinalShader);
@@ -2091,10 +2340,6 @@ var
 
     AProgram.BindUniforms(UniformsNodes, false);
 
-    if PassLightsUniforms then
-      for I := 0 to LightShaders.Count - 1 do
-        LightShaders[I].SetUniformsOnce(AProgram);
-
     ShadowMapShaders.SetUniformsOnce(AProgram);
     FSkinShader.SetUniformsOnce(AProgram);
 
@@ -2119,6 +2364,13 @@ var
 
 var
   ShaderType: TShaderType;
+  CacheKey, ProbePath: String;
+  LoadedBinary: Boolean;
+  PrepareTick, PrepareMs: QWord;
+  SurfacePart: Integer;
+  {$if defined(FPC) and not defined(OpenGLES)}
+  CachePart: Integer;
+  {$endif}
 begin
   EnableLightingModel; // do this early, as later EnableLights may assume it's done
   ShadowMapShaders.GenerateCode(Self);
@@ -2175,21 +2427,103 @@ begin
       end;
   end;
 
+  if FCacheDeformation and (Source[stGeometry].Count = 0) then
+  begin
+    Define('CASTLE_CACHE_DEFORMATION', stVertex, true);
+    if FCacheDeformationTangents then
+      Define('CASTLE_CACHE_DEFORMATION_TANGENTS', stVertex, true);
+    AProgram.CachedDeformation := True;
+  end;
+
+  { Rider surface morphs also participate in the procedural depth skin.
+    Effects use separate GLSL compilation units. Publish their capability to
+    all vertex parts only for materials that actually supply the attribute. }
+  for SurfacePart := 0 to Source[stVertex].Count - 1 do
+    if Pos('#define RIDER_SURFACE_MOTION', Source[stVertex][SurfacePart]) <> 0 then
+    begin
+      Define('RIDER_SURFACE_MOTION', stVertex, true);
+      if FSkinShader.Enabled then
+        Define('RIDER_SURFACE_NATIVE_SKIN', stVertex, true);
+      Break;
+    end;
+
+  if FDepthOnly then
+  begin
+    { Retain vertex/geometry deformation plugs, but no colour fragment work.
+      Alpha-tested shapes, custom shaders and clip planes use the full path. }
+    Source[stFragment].Clear;
+    Source[stFragment].Add('void main(void) { gl_FragColor = vec4(1.0); }');
+    Define('CASTLE_SHADOW_DEPTH', stVertex, true);
+    AProgram.ActiveUniformsOnly := True;
+  end;
+
   try
     if (Source[stVertex].Count = 0) and
        (Source[stFragment].Count = 0) then
       raise EGLSLError.Create('No vertex and no fragment shader for GLSL program');
 
+    if FDepthOnly then AProgram.Name := 'TShader:Depth:' + ShapeNiceName
+    else AProgram.Name := 'TShader:Shape:' + ShapeNiceName;
+    CacheKey := '';
+    {$if defined(FPC) and not defined(OpenGLES)}
+    { Each Effect still has its own GL program and uniform listeners. Share
+      only the compiled binary, keyed by generated code rather than the
+      identity of the Effect node. This prevents compiling the same ground
+      shader again for every tile's private origin/shadow uniforms. }
+    if AProgram.CachedDeformation then
+      { Preserve the existing rider cache keys exactly. }
+      CacheKey := 'rider-program-v1:position3-normal3-tangent4:interleaved:' +
+        IntToStr(Ord(InternalUpgradeGlslVersion))
+    else
+      { This LinkProgram path does not call glBindAttribLocation or
+        glBindFragDataLocation. Explicit layout qualifiers are in Source.
+        The only API-set pre-link binding is the rider feedback list above.
+        Bump this layout version if another pre-link binding is introduced. }
+      CacheKey := 'world-program-v1:attrib-auto:frag-auto:feedback-none:header-' +
+        IntToStr(Ord(InternalUpgradeGlslVersion)) + GLSLCacheHeaderSignature;
     for ShaderType := Low(ShaderType) to High(ShaderType) do
     begin
-      AProgram.AttachShader(ShaderType, Source[ShaderType]);
-      {$ifdef CASTLE_CANNOT_CATCH_EXCEPTIONS}
-      if AProgram.ErrorOnCompileLink then Exit;
+      CacheKey := CacheKey + ':' + IntToStr(Ord(ShaderType)) + ':' +
+        IntToStr(Source[ShaderType].Count);
+      for CachePart := 0 to Source[ShaderType].Count - 1 do
+        CacheKey := CacheKey + ':' + MD5Print(MD5String(Source[ShaderType][CachePart]));
+    end;
+    {$endif}
+    LoadedBinary := AProgram.TryLoadBinaryCache(CacheKey);
+    {$if defined(FPC) and not defined(OpenGLES)}
+    ProbePath := GetEnvironmentVariable('REZVIVO_SHADER_DUMP');
+    if (ProbePath <> '') and ForceDirectories(ProbePath) then
+    begin
+      ProbePath := IncludeTrailingPathDelimiter(ProbePath) + MD5Print(MD5String(CacheKey));
+      for ShaderType := Low(ShaderType) to High(ShaderType) do
+        Source[ShaderType].SaveToFile(ProbePath + '.' + IntToStr(Ord(ShaderType)) + '.glsl');
+      WritelnLog('ShaderKeyProbe', 'key=%s binary=%s name="%s"',
+        [ExtractFileName(ProbePath), BoolToStr(LoadedBinary, True), AProgram.Name]);
+    end;
+    {$endif}
+    if not LoadedBinary then
+    begin
+      for ShaderType := Low(ShaderType) to High(ShaderType) do
+      begin
+        AProgram.AttachShader(ShaderType, Source[ShaderType]);
+        {$ifdef CASTLE_CANNOT_CATCH_EXCEPTIONS}
+        if AProgram.ErrorOnCompileLink then Exit;
+        {$endif}
+      end;
+
+      {$ifndef OpenGLES}
+      if AProgram.CachedDeformation then
+        AProgram.SetTransformFeedbackVaryings([
+          'castle_CachedPosition', 'castle_CachedNormal', 'castle_CachedTangent']);
       {$endif}
     end;
-
-    AProgram.Name := 'TShader:Shape:' + ShapeNiceName;
-    AProgram.Link;
+    PrepareTick := GetTickCount64;
+    AProgram.Link; { includes renderer uniform/attribute initialization on a cache hit }
+    PrepareMs := GetTickCount64 - PrepareTick;
+    if PrepareMs > 100 then
+      WritelnLog('ResourcePrepare', 'stage=shader_link_apply ms=%d binary=%s name="%s"',
+        [PrepareMs, BoolToStr(LoadedBinary, true), AProgram.Name]);
+    if not LoadedBinary then AProgram.SaveBinaryCache(CacheKey);
 
     {$ifdef CASTLE_CANNOT_CATCH_EXCEPTIONS}
     if AProgram.ErrorOnCompileLink then Exit;
@@ -2216,7 +2550,12 @@ begin
   AProgram.UniformMissing := umIgnore;
 
   { set uniforms that will not need to be updated at each SetupUniforms call }
+  PrepareTick := GetTickCount64;
   SetupUniformsOnce;
+  PrepareMs := GetTickCount64 - PrepareTick;
+  if PrepareMs > 100 then
+    WritelnLog('ResourcePrepare', 'stage=shader_uniforms ms=%d name="%s"',
+      [PrepareMs, AProgram.Name]);
 end;
 
 procedure TShader.LinkFallbackProgram(AProgram: TX3DShaderProgram);
@@ -2239,6 +2578,12 @@ function TShader.CodeHash: TShaderCodeHash;
     lifetime. }
   procedure CodeHashFinalize;
   begin
+    FCacheDeformation := FCacheDeformation and (SelectedNode = nil);
+    FCodeHash.AddInteger(Ord(FCacheDeformation) * 1559);
+    FCodeHash.AddInteger(Ord(FCacheDeformationTangents) * 1567);
+    FDepthOnly := FDepthOnly and not FAlphaTest and
+      (SelectedNode = nil) and (ClipPlanesCount = 0);
+    FCodeHash.AddInteger(Ord(FDepthOnly) * 1543);
     FCodeHash.AddInteger(Ord(ShadowSampling) * 1009);
     FCodeHash.AddInteger(Ord(LightingModel) * 503);
     FCodeHash.AddInteger(Ord(ColorSpaceLinear) * 347);
@@ -2643,6 +2988,8 @@ begin
     ShapeRequiresShaders := true;
 
   LightShader.Prepare(FCodeHash, LightShaders.Count - 1);
+  { Light effects also have instance fields and affect generated source. }
+  FCodeHash.AddEffects(Light^.Node.FdEffects);
 end;
 
 procedure TShader.EnableFog(const FogType: TFogType;
@@ -2816,9 +3163,26 @@ end;
 procedure TShader.SetDynamicUniforms(AProgram: TX3DShaderProgram);
 var
   I: Integer;
+  Started, PartStarted: TTimerResult;
 begin
+  if ProfileSharedEffects then Started:=Timer;
+  AProgram.SharedUniformsTextures.Clear;
+  AProgram.ApplySharedEffects(AppearanceEffects);
+  if GroupEffects <> nil then
+    for I := 0 to GroupEffects.Count - 1 do AProgram.ApplySharedEffect(GroupEffects[I]);
+  for I := 0 to TextureShaders.Count - 1 do
+    if TextureShaders[I] is TTextureShader then
+      AProgram.ApplySharedEffects(TTextureShader(TextureShaders[I]).Node.FdEffects);
+  if ProfileSharedEffects then PartStarted := Timer;
   for I := 0 to LightShaders.Count - 1 do
+  begin
+    AProgram.ApplySharedEffects(LightShaders[I].Node.FdEffects);
     LightShaders[I].SetDynamicUniforms(AProgram);
+  end;
+  if ProfileSharedEffects then begin
+    LightUniformSeconds := LightUniformSeconds + TimerSeconds(Timer, PartStarted);
+    PartStarted := Timer;
+  end;
   for I := 0 to DynamicUniforms.Count - 1 do
     DynamicUniforms[I].SetUniform(AProgram);
 
@@ -2835,7 +3199,14 @@ begin
     MirrorPlaneUniforms.SetDynamicUniforms(AProgram);
 
   ShadowMapShaders.SetDynamicUniforms(AProgram, RenderingCamera);
+  if ProfileSharedEffects then begin
+    OtherUniformSeconds := OtherUniformSeconds + TimerSeconds(Timer, PartStarted);
+    PartStarted := Timer;
+  end;
   FSkinShader.SetDynamicUniforms(AProgram);
+  if ProfileSharedEffects then
+    NativeSkinUniformSeconds := NativeSkinUniformSeconds + TimerSeconds(Timer, PartStarted);
+  if ProfileSharedEffects then DynamicUniformSeconds:=DynamicUniformSeconds+TimerSeconds(Timer,Started);
 end;
 
 procedure TShader.AddScreenEffectCode(const Depth: boolean);
@@ -2872,7 +3243,7 @@ end;
 function TShader.NeedsNormals: Boolean;
 begin
   // optimize lmUnlit: no need for normals data
-  Result := (LightingModel <> lmUnlit) or NeedsNormalsForTexGen;
+  Result := (LightingModel <> lmUnlit) or NeedsNormalsForTexGen or FCacheDeformation;
 end;
 
 function TShader.ShapeBoundingBoxInWorld: TBox3D;

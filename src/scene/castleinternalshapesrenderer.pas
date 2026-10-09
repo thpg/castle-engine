@@ -26,6 +26,7 @@ uses CastleVectors, CastleSceneInternalShape, CastleRenderOptions,
   X3DNodes, CastleShapes, CastleUtils;
 
 type
+  TCollectedShapeFilter = function(const Shape: TShape): Boolean of object;
   { Collected information how to call TRenderEvent. }
   TCollectedRenderEvent = record
     Event: TRenderEvent;
@@ -44,24 +45,31 @@ type
     FCollected: TCollectedShapeList;
     FRenderEvents: TRenderEventList; //< may be nil, treat like empty
   public
+    { Optional borrowed filter; checked before allocating a collected entry. }
+    ShapeFilter: TCollectedShapeFilter;
     constructor Create(const OwnsObjects: Boolean);
     destructor Destroy; override;
-
-    { Add all shapes from Source that pass the filters.
-      Also add all collected render events (added to Source by AddRenderEvent). }
-    procedure AddFiltered(const Source: TShapesCollector;
-      const FilterTransparent: TBooleanSet;
-      const FilterShadowVolumesReceivers: TBooleanSet);
-
-    { Clear shapes to render. }
-    procedure Clear;
 
     { Add a shape to render.
       See TCollectedShape for the meaning of all the parameters. }
     procedure Add(const Shape: TGLShape; const RenderOptions: TCastleRenderOptions;
       const SceneTransform: TMatrix4; const SceneTransformDynamic: Boolean;
       const DepthRange: TDepthRange;
-      const ShadowVolumesReceiver: Boolean);
+      const ShadowVolumesReceiver: Boolean;
+      const ShadowCatcher: Boolean = false);
+
+    { Add all shapes from Source that pass the filters.
+      Also add all collected render events (added to Source by AddRenderEvent).
+      FilterOnlyShadowCatchers / FilterExcludeShadowCatchers select or skip
+      shapes marked as dedicated shadow catchers (depth prepass / lit pass). }
+    procedure AddFiltered(const Source: TShapesCollector;
+      const FilterTransparent: TBooleanSet;
+      const FilterShadowVolumesReceivers: TBooleanSet;
+      const FilterOnlyShadowCatchers: Boolean = false;
+      const FilterExcludeShadowCatchers: Boolean = false);
+
+    { Clear shapes to render. }
+    procedure Clear;
 
     { Add a custom rendering event.
       @seealso TRenderParams.AddRenderEvent. }
@@ -236,10 +244,12 @@ procedure TShapesCollector.Add(const Shape: TGLShape;
   const SceneTransform: TMatrix4;
   const SceneTransformDynamic: Boolean;
   const DepthRange: TDepthRange;
-  const ShadowVolumesReceiver: Boolean);
+  const ShadowVolumesReceiver: Boolean;
+  const ShadowCatcher: Boolean);
 var
   NewCollected: TCollectedShape;
 begin
+  if Assigned(ShapeFilter) and not ShapeFilter(Shape) then Exit;
   NewCollected := TCollectedShape.Create;
   NewCollected.Shape := Shape;
   NewCollected.RenderOptions := RenderOptions;
@@ -247,19 +257,24 @@ begin
   NewCollected.SceneTransformDynamic := SceneTransformDynamic;
   NewCollected.DepthRange := DepthRange;
   NewCollected.ShadowVolumesReceiver := ShadowVolumesReceiver;
+  NewCollected.ShadowCatcher := ShadowCatcher;
   FCollected.Add(NewCollected);
 end;
 
 procedure TShapesCollector.AddFiltered(const Source: TShapesCollector;
   const FilterTransparent: TBooleanSet;
-  const FilterShadowVolumesReceivers: TBooleanSet);
+  const FilterShadowVolumesReceivers: TBooleanSet;
+  const FilterOnlyShadowCatchers: Boolean;
+  const FilterExcludeShadowCatchers: Boolean);
 var
   CollectedShape: TCollectedShape;
 begin
   for CollectedShape in Source.FCollected do
-    if CollectedShape.UseBlending in FilterTransparent then
-      if CollectedShape.ShadowVolumesReceiver in FilterShadowVolumesReceivers then
-        FCollected.Add(CollectedShape);
+    if (CollectedShape.UseBlending in FilterTransparent) and
+       (CollectedShape.ShadowVolumesReceiver in FilterShadowVolumesReceivers) and
+       ((not FilterOnlyShadowCatchers) or CollectedShape.ShadowCatcher) and
+       ((not FilterExcludeShadowCatchers) or (not CollectedShape.ShadowCatcher)) then
+      FCollected.Add(CollectedShape);
 
   if Source.FRenderEvents <> nil then
   begin
@@ -385,6 +400,9 @@ begin
 
   if FBatching <> nil then
     FBatching.GLContextClose;
+
+  if FRenderer <> nil then
+    FRenderer.GLContextClose;
 end;
 
 function TShapesRenderer.Batching: TBatchShapes;
@@ -437,6 +455,7 @@ var
   procedure RenderNormal;
   var
     DepthRange: TDepthRange;
+    SavedChannels: TColorChannels;
   begin
     { Shadow maps require normal DepthRange,
       don't mess with DepthRange in case when we render shadow maps. }
@@ -445,10 +464,24 @@ var
     else
       DepthRange := CollectedShape.DepthRange;
 
-    Renderer.RenderShape(Shape, RenderOptions,
-      CollectedShape.SceneTransform,
-      CollectedShape.SceneTransformDynamic,
-      DepthRange);
+    { PATCH (Vatokat): depth-only pass — mask color writes per shape. The
+      renderer reapplies RenderOptions.InternalColorChannels for every shape
+      (castleinternalrenderer_renderer.inc), so a global RenderContext mask
+      would be overridden; swapping the shape's own channels works. }
+    if PassParams.OnlyDepth then
+    begin
+      SavedChannels := RenderOptions.InternalColorChannels;
+      RenderOptions.InternalColorChannels := [];
+      Renderer.RenderShape(Shape, RenderOptions,
+        CollectedShape.SceneTransform,
+        CollectedShape.SceneTransformDynamic,
+        DepthRange);
+      RenderOptions.InternalColorChannels := SavedChannels;
+    end else
+      Renderer.RenderShape(Shape, RenderOptions,
+        CollectedShape.SceneTransform,
+        CollectedShape.SceneTransformDynamic,
+        DepthRange);
   end;
 
   procedure RenderWireframe(UseWireframeColor: boolean);
@@ -622,6 +655,10 @@ begin
     should have a map "target->oq state" for various rendering targets. }
 
   if EffectiveOcclusionCulling and
+      { REZVIVO: scene-local opt-out also skips stale query results.
+        GPU skinning cannot use the rest-pose box for visibility recovery. }
+      ((not (CollectedShape.Shape.ParentScene is TCastleScene)) or
+       TCastleScene(CollectedShape.Shape.ParentScene).SceneOcclusionCulling) and
       (Params.RenderingCamera.Target = rtScreen) then
   begin
     FOcclusionCullingRenderer.Render(CollectedShape, Params, PassParams,
@@ -679,6 +716,8 @@ begin
       RenderContext.ProjectionMatrix;
     FOcclusionCullingRenderer.Utils.CameraMatrix :=
       Params.RenderingCamera.Matrix;
+    if Params.RenderingCamera.Target = rtScreen then
+      FOcclusionCullingRenderer.BeginView(Params);
   end;
 
   { Initialize Batching.
@@ -710,6 +749,10 @@ begin
       BlendingSort);
 
     FBlendingRenderer.RenderBegin;
+    { PATCH (Vatokat): allow the shadow volume renderer to write depth even
+      in a blending pass (depth-only prepass for transparent receivers). }
+    if PassParams.ForceDepthBufferUpdate then
+      RenderContext.DepthBufferUpdate := true;
   end else
   begin
     Shapes.FCollected.OnCustomShapeSort := OnCustomShapeSort;
@@ -771,40 +814,8 @@ begin
     FOcclusionCulling := Value;
   end;
 
-  (*
-  TODO:
-
-  If OcclusionCulling just changed:
-  If you switch OcclusionCulling on, then off, then move around the scene
-  a lot, then switch OcclusionCulling back on --- you don't want to use
-  results from previous query that was done many frames ago. }
-
-  Old approach below. Should be done differently, looking at frame ids?
-
-  procedure TCastleScene.ViewChangedSuddenly;
-  var
-    ShapeList: TShapeList;
-    Shape: TShape;
-  begin
-    inherited;
-
-    if EffectiveOcclusionCulling then
-    begin
-      { Set OcclusionQueryAsked := false for all shapes. }
-      ShapeList := Shapes.TraverseList(false, false, false);
-      for Shape in ShapeList do
-        TGLShape(Shape).OcclusionQueryAsked := false;
-    end;
-  end;
-  *)
-
-  { TODO: also Invalidate occlusion culling if camera moved a lot.
-
-    Should take care of all viewpoints switching, like
-    - switching to other viewpoint through castle-model-viewer "viewpoints" menu,
-    - just getting an event set_bind = true through vrml route.
-    - calling Camera.SetView / SetWorldView to teleport.
-  }
+  { Old query results are rejected by frame age. BeginView also rejects
+    results after a sharp camera change; toggling requires no scene walk. }
 end;
 
 end.

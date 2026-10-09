@@ -453,6 +453,15 @@ begin
     TGeometryArrays for shapes. Like InsideInline, InsidePrototype and many
     others. }
 
+  { REZVIVO/Vatokat: Shape_IncReference can still hold a TX3DGraphTraverseState
+    whose FVRML1State was already freed (teardown race with streaming tiles).
+    Guard before VRML1State.Nodes[] — otherwise GetNode(nil, vsCoordinate3) AV. }
+  if (SecondValue = nil) or (FVRML1State = nil) or (SecondValue.FVRML1State = nil) then
+  begin
+    Result := false;
+    Exit;
+  end;
+
   Result :=
     (IgnoreTransform or TMatrix4.PerfectlyEquals(
       Transformation.Transform,
@@ -464,7 +473,7 @@ begin
   if Result then
   begin
     for SN := Low(SN) to High(SN) do
-      if SecondValue.VRML1State.Nodes[SN] <> VRML1State.Nodes[SN] then
+      if SecondValue.FVRML1State.Nodes[SN] <> FVRML1State.Nodes[SN] then
         Exit(false);
   end;
 end;

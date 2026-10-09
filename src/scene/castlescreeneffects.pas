@@ -293,10 +293,18 @@ end;
 
 procedure TCastleScreenEffects.RemoveScreenEffect(const Node: TAbstractChildNode);
 begin
-  if ScreenEffectsRoot <> nil then
+  if (ScreenEffectsRoot <> nil) and (Node <> nil) then
   begin
-    ScreenEffectsRoot.FdChildren.Remove(Node);
-    ScreenEffectsRoot.FdChildren.Changed;
+    { ChangedAll first releases renderer resources through the previous
+      ScreenEffectNodes list. Keep its removed node alive until that list
+      has been rebuilt, even when this was the node's last parent. }
+    Node.KeepExistingBegin;
+    try
+      ScreenEffectsRoot.FdChildren.Remove(Node);
+      ScreenEffectsRoot.FdChildren.Changed;
+    finally
+      Node.KeepExistingEnd;
+    end;
   end;
 end;
 

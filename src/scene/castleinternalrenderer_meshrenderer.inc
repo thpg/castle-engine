@@ -201,8 +201,11 @@ var
       begin
         { Do not make warnings about missing internal attributes
           (for the same reason as uniform values, see GLRendererShader). }
-        if not Arrays.Attribs[I].Internal then
-          WritelnWarning('VRML/X3D', 'Shader attribute "' + Arrays.Attribs[I].Name + '" not found (or not used)');
+        { Depth-only programs intentionally omit colour/material attributes. }
+        if (not Arrays.Attribs[I].Internal) and
+           (not ((GLSLProgram is TX3DShaderProgram) and
+             TX3DShaderProgram(GLSLProgram).ActiveUniformsOnly)) then
+          GLSLProgram.WarnMissingAttribute(Arrays.Attribs[I].Name);
         Continue;
       end;
       case Arrays.Attribs[I].AType of
@@ -354,6 +357,106 @@ var
       MaterialUnlitExplicit(White);
   end;
 
+  procedure PrepareCachedPose;
+  {$ifndef OpenGLES}
+  const PoseStride = 10 * SizeOf(Single);
+  var
+    C: TShapeCache;
+    P: TX3DShaderProgram;
+    Frame: QWord;
+    Revision: QWord;
+    RevisionDriven, CaptureNeeded: Boolean;
+    WriteIndex: Integer;
+  {$endif}
+  begin
+    {$ifndef OpenGLES}
+    C := Shape.Cache;
+    if C = nil then Exit;
+    { Generated shadow textures run during Update, before Render begins. }
+    Frame := TFramesPerSecond.FrameId;
+    Revision := RenderOptions.CachedAnimationRevision;
+    RevisionDriven := Revision <> 0;
+    if not (CurrentMeshShader is TX3DShaderProgram) then Exit;
+    P := TX3DShaderProgram(CurrentMeshShader);
+    if P.CachedDeformation then P.SetUniform('castle_DeformationMode', 0);
+    if not (UseCachedRiderMeshes and P.CachedDeformation and
+      (Vbo[vtCoordinate] <> GLObjectNone) and (C.References = 1) and
+      (RevisionDriven or (Renderer.RenderingCamera.Target = rtShadowMap) or
+        (C.PoseFrame = Frame))) then
+    begin
+      if C.PoseSize <> 0 then C.ClearPose;
+      Exit;
+    end;
+
+    if (not C.PoseValid) or (C.PoseSize <> Arrays.Count * PoseStride) or
+      ((not RevisionDriven) and (C.PoseFrame <> Frame) and (C.PoseFrame + 1 <> Frame)) then
+    begin
+      C.ClearPose;
+      C.PoseSize := Arrays.Count * PoseStride;
+      if LogShaders then
+        WritelnLog('GPU pose', 'Allocate "%s": %d vertices, %d indices, %d bytes in two buffers',
+          [Shape.NiceName, Arrays.Count, Arrays.IndexesCount, C.PoseSize * 2]);
+      glGenBuffers(2, @C.PoseVbo[0]);
+      for WriteIndex := 0 to 1 do
+      begin
+        RenderContext.BindBuffer[btArray] := C.PoseVbo[WriteIndex];
+        glBufferData(GL_ARRAY_BUFFER, C.PoseSize, nil, GL_STREAM_COPY);
+      end;
+    end;
+
+    if RevisionDriven then
+      CaptureNeeded := (not C.PoseValid) or (C.PoseRevision <> Revision)
+    else
+      CaptureNeeded := C.PoseFrame <> Frame;
+    if C.PoseFrame <> Frame then
+    begin
+      C.PoseFrame := Frame;
+      if C.PosePending then
+      begin
+        C.PoseRead := 1 - C.PoseRead;
+        C.PosePending := false;
+      end;
+    end;
+    if CaptureNeeded then
+    begin
+      C.PoseRevision := Revision;
+      WriteIndex := 1 - C.PoseRead;
+      P.SetUniform('castle_DeformationMode', 1);
+      glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, C.PoseVbo[WriteIndex]);
+      glEnable(GL_RASTERIZER_DISCARD);
+      try
+        glBeginTransformFeedback(GL_POINTS);
+        glDrawArrays(GL_POINTS, 0, Arrays.Count);
+        glEndTransformFeedback;
+      finally
+        glDisable(GL_RASTERIZER_DISCARD);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
+      end;
+      Inc(CachedMeshCaptures);
+      if C.PoseValid and UseDelayedRiderMeshes then
+        { Same-context GPU commands order feedback writes before vertex
+          fetch. Do not poll a fence here: it would skip pose updates when
+          the CPU submits frames ahead of the GPU. }
+        C.PosePending := true
+      else
+      begin
+        { First pose/current-frame mode: commands in this GL context are
+          ordered, so vertex fetch sees the completed feedback writes. }
+        C.PoseRead := WriteIndex;
+        C.PoseValid := true;
+      end;
+    end;
+
+    RenderContext.BindBuffer[btArray] := C.PoseVbo[C.PoseRead];
+    P.AttributeCastle_Vertex.EnableArrayVector3(Vao, PoseStride, 0);
+    P.AttributeCastle_Normal.EnableArrayVector3(Vao, PoseStride, 3 * SizeOf(Single));
+    if Arrays.HasTangent then
+      P.AttributeCastle_Tangent.EnableArrayVector4(Vao, PoseStride, 6 * SizeOf(Single));
+    P.SetUniform('castle_DeformationMode', 2);
+    Inc(CachedMeshDraws);
+    {$endif}
+  end;
+
 const
   ToMode: array [TGeometryPrimitive] of TGLenum = (
     GL_TRIANGLES,
@@ -369,10 +472,19 @@ var
   First: Cardinal;
   Mode: TGLenum;
   TexCoordAttrib: TGLSLAttribute;
+  ProfileStarted: TTimerResult;
+  {$ifdef REZVIVO_STARTUP_TIMING}
+  TimingStart: QWord;
+  {$endif}
 begin
   Attribs := nil;
 
+  if ProfileSharedEffects then ProfileStarted := Timer;
   RenderCoordinateBegin;
+  if ProfileSharedEffects then begin
+    MeshBeginSeconds := MeshBeginSeconds + TimerSeconds(Timer, ProfileStarted);
+    ProfileStarted := Timer;
+  end;
   try
     if not PrepareRenderShape then
     begin
@@ -390,6 +502,12 @@ begin
       if CurrentMeshShader <> nil then
       begin
         CurrentMeshShader.UniformCastle_ModelViewMatrix.SetValue(ShapeModelView);
+        { Effects that need stable world positions must not reconstruct them
+          from a rounded, camera-rotated eye position. No work for shaders
+          that do not use this optional uniform. }
+        if CurrentMeshShader.UniformCastle_ModelMatrix.Location <> GLUniformLocationNone then
+          CurrentMeshShader.UniformCastle_ModelMatrix.SetValue(
+            Shader.SceneTransform * Shape.State.Transformation.Transform);
         CurrentMeshShader.UniformCastle_ProjectionMatrix.SetValue(RenderContext.ProjectionMatrix);
         if Shader.NeedsNormals then
           CurrentMeshShader.UniformCastle_NormalMatrix.SetValue(ModelViewToNormalMatrix(ShapeModelView));
@@ -528,6 +646,25 @@ begin
       if (Arrays.Attribs.Count <> 0) and (CurrentMeshShader <> nil) then
         EnableVertexAttrib(CurrentMeshShader);
 
+      {$ifdef REZVIVO_STARTUP_TIMING}
+      TimingStart := GetTickCount64;
+      {$endif}
+      if ProfileSharedEffects then begin
+        MeshAttributesSeconds := MeshAttributesSeconds + TimerSeconds(Timer, ProfileStarted);
+        ProfileStarted := Timer;
+      end;
+      PrepareCachedPose;
+      if ProfileSharedEffects then begin
+        MeshPoseSeconds := MeshPoseSeconds + TimerSeconds(Timer, ProfileStarted);
+        ProfileStarted := Timer;
+      end;
+      {$ifdef REZVIVO_STARTUP_TIMING}
+      if GetTickCount64 - TimingStart >= 100 then
+        WritelnLog('StartupTiming', 'capture ms=%d name=%s',
+          [GetTickCount64 - TimingStart, CurrentMeshShader.Name]);
+      TimingStart := GetTickCount64;
+      {$endif}
+
       Mode := ToMode[Arrays.Primitive];
       First := 0;
       if Arrays.HasIndexes then
@@ -560,6 +697,15 @@ begin
           end;
       end;
 
+      {$ifdef REZVIVO_STARTUP_TIMING}
+      if (GetTickCount64 - TimingStart >= 100) and (CurrentMeshShader <> nil) then
+        WritelnLog('StartupTiming', 'draw ms=%d name=%s',
+          [GetTickCount64 - TimingStart, CurrentMeshShader.Name]);
+      {$endif}
+      if ProfileSharedEffects then begin
+        MeshDrawSeconds := MeshDrawSeconds + TimerSeconds(Timer, ProfileStarted);
+        ProfileStarted := Timer;
+      end;
       { update Renderer.Statistics.DrawCalls }
       if Arrays.Counts = nil then
         Inc(Renderer.Statistics^.DrawCalls)
@@ -573,7 +719,11 @@ begin
         3. It is not available on OpenGLES. }
       DisableArrays;
     end;
-  finally RenderCoordinateEnd end;
+  finally
+    RenderCoordinateEnd;
+    if ProfileSharedEffects then
+      MeshEndSeconds := MeshEndSeconds + TimerSeconds(Timer, ProfileStarted);
+  end;
 end;
 
 procedure TBaseCoordinateRenderer.RenderCoordinateBegin;
@@ -1026,6 +1176,19 @@ end;
 
 procedure TShaderCoordinateRenderer.RenderCoordinateBegin;
 
+  function CacheEffectEnabled: Boolean;
+  var I: Integer; N: TX3DNode;
+  begin
+    Result := false;
+    if State.Appearance = nil then Exit;
+    for I := 0 to State.Appearance.FdEffects.Count - 1 do
+    begin
+      N := State.Appearance.FdEffects[I];
+      if (N is TEffectNode) and TEffectNode(N).Enabled and
+        TEffectNode(N).InternalCacheVertexAnimation then Exit(true);
+    end;
+  end;
+
   { Initialize Shader.LightingModel.
     Must be done before linking the shader.
     Logic must follow *exactly* FinalizeLightingModel (which must be done after
@@ -1059,10 +1222,23 @@ procedure TShaderCoordinateRenderer.RenderCoordinateBegin;
 var
   CurrentX3DProgram: TX3DShaderProgram;
   Pass: TTotalRenderingPass;
+  ProfileStarted: TTimerResult;
 begin
   inherited;
 
+  if ProfileSharedEffects then ProfileStarted := Timer;
   InitializeLightingModel;
+
+  Shader.DepthOnly := UseFastShadowShaders and
+    (Renderer.RenderingCamera.Target = rtShadowMap);
+
+  {$ifndef OpenGLES}
+  Shader.CacheDeformation := Shader.NeedsSkinWeightsJoints and
+    GLFeatures.TransformFeedbackVaryings and
+    Assigned(glTransformFeedbackVaryings) and Assigned(glBeginTransformFeedback) and
+    Assigned(glBindBufferBase) and CacheEffectEnabled;
+  Shader.CacheDeformationTangents := Shader.CacheDeformation and Arrays.HasTangent;
+  {$endif}
 
   if CustomShaders <> nil then
   begin
@@ -1117,14 +1293,19 @@ begin
       CurrentMeshShader := CurrentX3DProgram;
       if not GLFeatures.EnableFixedFunction then
         Assert(CurrentX3DProgram <> nil, 'Shader is not initialized, but it has to be (creation of fallback shaders failed?)');
+      if ProfileSharedEffects then
+        MeshShaderSeconds := MeshShaderSeconds + TimerSeconds(Timer, ProfileStarted);
       if CurrentX3DProgram <> nil then // may be nil on desktops
         Shader.SetDynamicUniforms(CurrentX3DProgram);
     end else
       CurrentMeshShader := nil;
   end;
 
+  if ProfileSharedEffects then ProfileStarted := Timer;
   RenderContext.CurrentProgram := CurrentMeshShader; // enable the CurrentMeshShader for OpenGL
 
   if CurrentMeshShader <> nil then
     CurrentMeshShader.SetupUniforms(BoundTextureUnits);
+  if ProfileSharedEffects then
+    MeshTextureSeconds := MeshTextureSeconds + TimerSeconds(Timer, ProfileStarted);
 end;

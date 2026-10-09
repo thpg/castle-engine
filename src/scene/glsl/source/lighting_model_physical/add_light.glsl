@@ -143,6 +143,7 @@ void PLUG_add_light(inout vec4 color,
      IOW, "normalize(- vertex_eye)" because camera position is zero in eye-space.
   */
   AngularInfo angularInfo = getAngularInfo(light_dir, normal_eye, view);
+  vec3 light_contribution = vec3(0.0);
 
   if (angularInfo.NdotL > 0.0 || angularInfo.NdotV > 0.0)
   {
@@ -155,16 +156,30 @@ void PLUG_add_light(inout vec4 color,
     vec3 diffuseContrib = (1.0 - F) * diffuse(material_info);
     vec3 specContrib = F * Vis * D;
 
+#ifdef LIGHT<Light>_TYPE_PUNCTUAL
+    /* PLUG: physical_light_surface (diffuseContrib, specContrib, light_dir, normal_eye, view) */
+#endif
+
 #ifdef LIGHT<Light>_TYPE_ENVIRONMENT
   diffuseContrib *= textureCube(diffuseTexture, light_dir).rgb;
   specContrib *= textureCube(specularTexture, light_dir).rgb;
 #endif
 
     // Obtain final intensity as reflectance (BRDF) scaled by the energy of the light (cosine law)
-    vec3 light_contribution = angularInfo.NdotL * (diffuseContrib + specContrib);
+    light_contribution = angularInfo.NdotL * (diffuseContrib + specContrib);
+  }
+
+#ifdef LIGHT<Light>_TYPE_PUNCTUAL
+  /* PLUG: physical_light_contribution (light_contribution, light_dir, normal_eye, view) */
+#endif
+
+#ifdef LIGHT<Light>_TYPE_ENVIRONMENT
+  /* Environment shaders integrate the hemisphere, rather than treating N as
+     a punctual source. Keep this optional for existing CGE materials. */
+  /* PLUG: physical_environment (light_contribution, normal_eye, view, material_info.diffuseColor, material_info.reflectance0, material_info.perceptualRoughness) */
+#endif
 
     color.rgb += castle_LightSource<Light>Color *
       light_contribution *
       scale;
-  }
 }

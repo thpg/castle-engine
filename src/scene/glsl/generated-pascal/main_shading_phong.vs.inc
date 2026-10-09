@@ -13,6 +13,17 @@
 'uniform mat4 castle_ModelViewMatrix;' + LineEnding +
 'uniform mat4 castle_ProjectionMatrix;' + LineEnding +
 'attribute vec4 castle_Vertex;' + LineEnding +
+'#ifdef CASTLE_CACHE_DEFORMATION' + LineEnding +
+'uniform int castle_DeformationMode; // 0: original, 1: capture, 2: ready mesh' + LineEnding +
+'varying vec3 castle_CachedPosition;' + LineEnding +
+'varying vec3 castle_CachedNormal;' + LineEnding +
+'varying vec4 castle_CachedTangent;' + LineEnding +
+'mat4 skinMatrix;' + LineEnding +
+'#ifdef CASTLE_CACHE_DEFORMATION_TANGENTS' + LineEnding +
+'attribute vec4 castle_Tangent;' + LineEnding +
+'#endif' + LineEnding +
+'#endif' + LineEnding +
+'' + LineEnding +
 '' + LineEnding +
 '#if defined(CASTLE_HAS_NORMALS)' + LineEnding +
 'uniform mat3 castle_NormalMatrix;' + LineEnding +
@@ -60,8 +71,30 @@
 '    vec3(0.0, 0.0, 1.0);' + LineEnding +
 '    #endif' + LineEnding +
 '' + LineEnding +
+'  #ifdef CASTLE_CACHE_DEFORMATION' + LineEnding +
+'  if (castle_DeformationMode != 2) {' + LineEnding +
+'  #endif' + LineEnding +
 '  /* PLUG: vertex_object_space_change (vertex_object, normal_object) */' + LineEnding +
 '  /* PLUG: vertex_object_space (vertex_object, normal_object) */' + LineEnding +
+'  #ifdef CASTLE_CACHE_DEFORMATION' + LineEnding +
+'  } else {' + LineEnding +
+'    // Cached tangents have already received the native skin transform.' + LineEnding +
+'    skinMatrix = mat4(1.0);' + LineEnding +
+'  }' + LineEnding +
+'  castle_CachedPosition = vertex_object.xyz;' + LineEnding +
+'  castle_CachedNormal = normal_object;' + LineEnding +
+'  vec4 cache_tangent = vec4(0.0, 0.0, 0.0, 1.0);' + LineEnding +
+'  #ifdef CASTLE_CACHE_DEFORMATION_TANGENTS' + LineEnding +
+'  cache_tangent = castle_Tangent;' + LineEnding +
+'  /* PLUG: tangent_object_space (cache_tangent) */' + LineEnding +
+'  #endif' + LineEnding +
+'  castle_CachedTangent = cache_tangent;' + LineEnding +
+'  if (castle_DeformationMode == 1) {' + LineEnding +
+'    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);' + LineEnding +
+'    return;' + LineEnding +
+'  }' + LineEnding +
+'  #endif' + LineEnding +
+'' + LineEnding +
 '' + LineEnding +
 '  castle_vertex_eye = castle_ModelViewMatrix * vertex_object;' + LineEnding +
 '' + LineEnding +
@@ -83,5 +116,4 @@
 '' + LineEnding +
 '  gl_Position = castle_ProjectionMatrix * castle_vertex_eye;' + LineEnding +
 '}' + LineEnding +
-'/* CASTLE-MAIN-END */' + LineEnding +
-''
+'/* CASTLE-MAIN-END */' + LineEnding

@@ -145,6 +145,7 @@
 '     IOW, "normalize(- vertex_eye)" because camera position is zero in eye-space.' + LineEnding +
 '  */' + LineEnding +
 '  AngularInfo angularInfo = getAngularInfo(light_dir, normal_eye, view);' + LineEnding +
+'  vec3 light_contribution = vec3(0.0);' + LineEnding +
 '' + LineEnding +
 '  if (angularInfo.NdotL > 0.0 || angularInfo.NdotV > 0.0)' + LineEnding +
 '  {' + LineEnding +
@@ -157,17 +158,31 @@
 '    vec3 diffuseContrib = (1.0 - F) * diffuse(material_info);' + LineEnding +
 '    vec3 specContrib = F * Vis * D;' + LineEnding +
 '' + LineEnding +
+'#ifdef LIGHT<Light>_TYPE_PUNCTUAL' + LineEnding +
+'    /* PLUG: physical_light_surface (diffuseContrib, specContrib, light_dir, normal_eye, view) */' + LineEnding +
+'#endif' + LineEnding +
+'' + LineEnding +
 '#ifdef LIGHT<Light>_TYPE_ENVIRONMENT' + LineEnding +
 '  diffuseContrib *= textureCube(diffuseTexture, light_dir).rgb;' + LineEnding +
 '  specContrib *= textureCube(specularTexture, light_dir).rgb;' + LineEnding +
 '#endif' + LineEnding +
 '' + LineEnding +
 '    // Obtain final intensity as reflectance (BRDF) scaled by the energy of the light (cosine law)' + LineEnding +
-'    vec3 light_contribution = angularInfo.NdotL * (diffuseContrib + specContrib);' + LineEnding +
+'    light_contribution = angularInfo.NdotL * (diffuseContrib + specContrib);' + LineEnding +
+'  }' + LineEnding +
+'' + LineEnding +
+'#ifdef LIGHT<Light>_TYPE_PUNCTUAL' + LineEnding +
+'  /* PLUG: physical_light_contribution (light_contribution, light_dir, normal_eye, view) */' + LineEnding +
+'#endif' + LineEnding +
+'' + LineEnding +
+'#ifdef LIGHT<Light>_TYPE_ENVIRONMENT' + LineEnding +
+'  /* Environment shaders integrate the hemisphere, rather than treating N as' + LineEnding +
+'     a punctual source. Keep this optional for existing CGE materials. */' + LineEnding +
+'  /* PLUG: physical_environment (light_contribution, normal_eye, view, material_info.diffuseColor, material_info.reflectance0, material_info.perceptualRoughness) */' + LineEnding +
+'#endif' + LineEnding +
 '' + LineEnding +
 '    color.rgb += castle_LightSource<Light>Color *' + LineEnding +
 '      light_contribution *' + LineEnding +
 '      scale;' + LineEnding +
-'  }' + LineEnding +
 '}' + LineEnding +
 ''

@@ -275,11 +275,13 @@ type
   private
     ProgramId: TGLprogram;
     ShaderIds: TGLShaderList;
+    FSaveBinaryRequested: Boolean;
 
     FUniformMissing: TUniformMissing;
     FUniformLocations: TUniformLocationCache;
     FAttributeLocations: TAttribLocationCache;
     FUniformReportedMissing: TStringList;
+    FAttributeReportedMissing: TStringList;
 
     // Given stage was attached and compiled by @link(AttachShader).
     HasStage: array [TShaderType] of Boolean;
@@ -306,7 +308,6 @@ type
   public
     { Shader name is used in log messages. Any String is OK. }
     Name: String;
-
     {$ifdef CASTLE_CANNOT_CATCH_EXCEPTIONS}
     { Web target doesn't support try..except, so we use this field
       to report that AttachShader or Link caused an error.
@@ -373,6 +374,12 @@ type
       This must be called before @link(Link) method. }
     procedure SetTransformFeedbackVaryings(const Varyings: array of String;
       const IsSingleBufferMode: Boolean = True);
+
+    { Optional cache for expensive generated programs. The caller's key must
+      cover every shader stage and link option. Each load creates an independent
+      GL program, so uniforms are never shared between riders/materials. }
+    function TryLoadBinaryCache(const Key: String): Boolean;
+    procedure SaveBinaryCache(const Key: String);
 
     { Link the program, this should be done after attaching all shaders
       and before actually using the program.
@@ -570,6 +577,9 @@ type
       methods are silently ignored. }
     function AttributeOptional(const AName: string): TGLSLAttribute;
 
+    { Report an unused external attribute once per linked program. }
+    procedure WarnMissingAttribute(const AName: string);
+
     { Set attribute variable value.
       The used type must match the type of this variable in GLSL program.
 
@@ -619,12 +629,22 @@ type
       calls. }
     class property Current: TGLSLProgram read GetCurrent write SetCurrent; deprecated 'use RenderContext.CurrentProgram';
     {$endif}
+    { REZVIVO: process counters for explicit diagnostics / regression probes.
+      No per-frame logging and no shared GL program or uniform state. }
+    class var BinaryCacheHits, BinaryCacheMisses, BinaryCacheStores: QWord;
   end;
 
   TGLSLProgramList = {$ifdef FPC}specialize{$endif} TObjectList<TGLSLProgram>;
 
 var
   LogShaders: boolean;
+  { Diagnostic switch. GLSL identifiers and shader fingerprints are compared
+    exactly, not with the user's language-dependent collation rules. }
+  UseBinaryShaderNames: Boolean = True;
+
+{ Configure internal shader-name lists; changing the diagnostic mode also
+  restores the correct sort order before binary search. }
+procedure ConfigureShaderNameList(const Names: TStringList);
 
 {$ifdef FPC}
 function GetCurrentProgram: TGLSLProgram;
@@ -659,10 +679,257 @@ var
     @exclude }
   InternalUpgradeGlslVersion: Boolean = true;
 
+{ Signature of the actual built-in GLSL headers, for binary cache invalidation. }
+function GLSLCacheHeaderSignature: String;
+
 implementation
 
 uses CastleStringUtils, CastleLog, CastleGLVersion, CastleRenderContext,
-  CastleInternalGLUtils, CastleApplicationProperties;
+  CastleInternalGLUtils, CastleApplicationProperties
+  {$if defined(FPC) and not defined(OpenGLES)}, MD5{$endif};
+
+const
+  {$ifdef OpenGLES}
+  GLES30CoreHeader: array [TShaderType] of String = (
+    // vertex
+    '#version 300 es' + NL +
+    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
+    '#define attribute in' + NL +
+    '#define varying out' + NL +
+    '#define texture2D texture' + NL +
+    '#define texture3D texture' + NL +
+    '#define textureCube texture' + NL +
+    '#define texture2DProj textureProj' + NL +
+    '#define texture3DProj textureProj' + NL +
+    { Otherwise each sampler2DShadow would have to contain precision specifier.
+      EXT_shadow_samplers says that lowp is default, so presumably it is OK:
+      https://registry.khronos.org/OpenGL/extensions/EXT/EXT_shadow_samplers.txt }
+    'precision lowp sampler2DShadow;' + NL +
+    { Otherwise each sampler3D would have to contain precision specifier.
+      3D textures are part of OpenGLES 3.0 core, so it's OK to use sampler3D here.
+      Testcase that this is needed: castle-model-viewer, compiled with OpenGLES,
+      viewing demo-models/water/caustics/Barna29.x3dv . }
+    'precision lowp sampler3D;' + NL,
+
+    // geometry - not supported by OpenGLES
+    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL,
+
+    // fragment
+    '#version 300 es' + NL +
+    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
+    '#define varying in' + NL +
+    '#define texture2D texture' + NL +
+    '#define texture3D texture' + NL +
+    '#define textureCube texture' + NL +
+    '#define texture2DProj textureProj' + NL +
+    '#define texture3DProj textureProj' + NL +
+    '#define gl_FragColor castle_FragColor' + NL +
+    'out mediump vec4 castle_FragColor;' + NL +
+    { We need to use highp for shadow maps processing on mobile,
+      to make the shadows look good,
+      see https://github.com/castle-engine/castle-engine/pull/674 }
+    '#define shadowsPrecision highp' + NL +
+    'precision lowp sampler2DShadow;' + NL +
+    'precision lowp sampler3D;' + NL
+  );
+  {$else}
+  GL31CoreHeader: array [TShaderType] of String = (
+    // vertex
+    '#version 140' + NL +
+    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
+    '#define attribute in' + NL +
+    '#define varying out' + NL +
+    '#define texture2D texture' + NL +
+    '#define texture3D texture' + NL +
+    '#define textureCube texture' + NL +
+    '#define texture2DProj textureProj' + NL +
+    '#define texture3DProj textureProj' + NL,
+
+    // geometry
+    '#version 150' + NL +
+    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL,
+
+    // fragment
+    '#version 140' + NL +
+    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
+    '#define varying in' + NL +
+    '#define texture2D texture' + NL +
+    '#define texture3D texture' + NL +
+    '#define textureCube texture' + NL +
+    '#define texture2DProj textureProj' + NL +
+    '#define texture3DProj textureProj' + NL +
+    '#define gl_FragColor castle_FragColor' + NL +
+    'out mediump vec4 castle_FragColor;' + NL +
+    '#define shadowsPrecision' + NL
+  );
+  {$endif}
+
+
+{$if defined(FPC) and not defined(OpenGLES)}
+type
+  TProgramBinaryHeader = packed record
+    Magic, BinaryFormat, DataLength: UInt32;
+    Digest: TMD5Digest;
+  end;
+
+function ProgramBinaryFile(const Key: String): String;
+var Driver, Directory: String;
+begin
+  Driver := String(PAnsiChar(glGetString(GL_VENDOR))) + #0 +
+    String(PAnsiChar(glGetString(GL_RENDERER))) + #0 +
+    String(PAnsiChar(glGetString(GL_VERSION))) + #0 +
+    String(PAnsiChar(glGetString(GL_SHADING_LANGUAGE_VERSION)));
+  Directory := GetEnvironmentVariable('REZVIVO_TEST_SHADER_CACHE_DIR');
+  if Directory = '' then
+    Directory := IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'shader-cache';
+  Result := IncludeTrailingPathDelimiter(Directory) +
+    MD5Print(MD5String(Driver + #0 + Key)) + '.gpb';
+end;
+
+function ProgramBinarySupported: Boolean;
+var Count: GLint;
+begin
+  Result := (GL_VERSION_4_1 or GL_ARB_get_program_binary) and
+    Assigned(glProgramBinary) and Assigned(glGetProgramBinary) and
+    Assigned(glProgramParameteri) and (GetEnvironmentVariable('REZVIVO_SHADER_CACHE') <> '0');
+  if not Result then Exit;
+  Count := 0;
+  glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, @Count);
+  Result := Count > 0;
+end;
+
+procedure TrimProgramBinaryCache(const Directory: String);
+const Budget = 256 * 1024 * 1024;
+var Search: TSearchRec; Total: Int64; Oldest: LongInt; OldestFile: String;
+begin
+  { Only disposable shader binaries in this directory. Bound growth across
+    edited shaders and driver upgrades; never touch configuration files. }
+  repeat
+    Total := 0; Oldest := High(LongInt); OldestFile := '';
+    if FindFirst(Directory + '*.gpb', faAnyFile, Search) = 0 then
+    begin
+      repeat
+        if (Search.Attr and faDirectory) <> 0 then Continue;
+        Inc(Total, Search.Size);
+        if Search.Time <= Oldest then
+        begin Oldest := Search.Time; OldestFile := Directory + Search.Name; end;
+      until FindNext(Search) <> 0;
+      FindClose(Search);
+    end;
+    if (Total <= Budget) or (OldestFile = '') then Break;
+    if not DeleteFile(OldestFile) then Break;
+  until False;
+end;
+{$endif}
+
+function GLSLCacheHeaderSignature: String;
+{$if defined(FPC) and not defined(OpenGLES)}
+var ShaderType: TShaderType;
+{$endif}
+begin
+  Result := '';
+  {$if defined(FPC) and not defined(OpenGLES)}
+  for ShaderType := Low(TShaderType) to High(TShaderType) do
+    Result := Result + ':' + MD5Print(MD5String(GL31CoreHeader[ShaderType]));
+  {$endif}
+end;
+
+function TGLSLProgram.TryLoadBinaryCache(const Key: String): Boolean;
+{$if defined(FPC) and not defined(OpenGLES)}
+var Stream: TFileStream; H: TProgramBinaryHeader; Data: array of Byte;
+  Linked, Count, I: GLint; FileName: String; Formats: array of GLint;
+  FormatSupported: Boolean;
+  Started, ReadStarted, PrepareMs: QWord;
+{$endif}
+begin
+  Result := False;
+  {$if defined(FPC) and not defined(OpenGLES)}
+  FSaveBinaryRequested := (Key <> '') and ProgramBinarySupported;
+  if not FSaveBinaryRequested then Exit;
+  Inc(BinaryCacheMisses);
+  FileName := ProgramBinaryFile(Key);
+  if not FileExists(FileName) then Exit;
+  ReadStarted := GetTickCount64;
+  try
+    Stream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+    try
+      if Stream.Size < SizeOf(H) then Exit;
+      Stream.ReadBuffer(H, SizeOf(H));
+      if (H.Magic <> $31425047) or (H.DataLength = 0) or
+         (H.DataLength > 32 * 1024 * 1024) or
+         (Stream.Size <> SizeOf(H) + Int64(H.DataLength)) then Exit;
+      SetLength(Data, H.DataLength);
+      Stream.ReadBuffer(Data[0], H.DataLength);
+      if not MD5Match(H.Digest, MD5Buffer(Data[0], H.DataLength)) then Exit;
+    finally Stream.Free; end;
+    glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, @Count);
+    if (Count < 1) or (Count > 128) then Exit;
+    SetLength(Formats, Count);
+    glGetIntegerv(GL_PROGRAM_BINARY_FORMATS, @Formats[0]);
+    FormatSupported := False;
+    for I := 0 to Count - 1 do
+      if UInt32(Formats[I]) = H.BinaryFormat then FormatSupported := True;
+    if not FormatSupported then Exit;
+    PrepareMs := GetTickCount64 - ReadStarted;
+    if PrepareMs > 100 then
+      WritelnLog('ResourcePrepare', 'stage=program_binary_read ms=%d bytes=%d name="%s"',
+        [PrepareMs, H.DataLength, Name]);
+    Started := GetTickCount64;
+    glProgramParameteri(ProgramId, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+    glProgramBinary(ProgramId, H.BinaryFormat, @Data[0], H.DataLength);
+    glGetProgramiv(ProgramId, GL_LINK_STATUS, @Linked);
+    Result := Linked = GL_TRUE;
+    if Result then begin Inc(BinaryCacheHits); Dec(BinaryCacheMisses); end;
+    PrepareMs := GetTickCount64 - Started;
+    if PrepareMs > 100 then
+      WritelnLog('ResourcePrepare', 'stage=program_binary_load ms=%d bytes=%d format=%d ok=%s name="%s"',
+        [PrepareMs, H.DataLength, H.BinaryFormat, BoolToStr(Result, true), Name]);
+    if LogShaders and Result then WritelnLog('GLSL binary cache',
+      'Loaded %s (%d ms)', [Name, GetTickCount64 - Started]);
+  except
+    { Cache permissions/corruption cannot prevent a normal source compile. }
+    Result := False;
+  end;
+  {$endif}
+end;
+
+procedure TGLSLProgram.SaveBinaryCache(const Key: String);
+{$if defined(FPC) and not defined(OpenGLES)}
+var Stream: TFileStream; H: TProgramBinaryHeader; Data: array of Byte;
+  Size, Actual: GLint; FileName, TempName: String;
+{$endif}
+begin
+  {$if defined(FPC) and not defined(OpenGLES)}
+  if (Key = '') or not ProgramBinarySupported then Exit;
+  TempName := '';
+  try
+    glGetProgramiv(ProgramId, GL_PROGRAM_BINARY_LENGTH, @Size);
+    if GetEnvironmentVariable('REZVIVO_SHADER_DIAGNOSTICS') = '1' then
+      WritelnLog('ShaderBinaryProbe', 'bytes=%d name="%s"', [Size, Name]);
+    if (Size <= 0) or (Size > 32 * 1024 * 1024) then Exit;
+    SetLength(Data, Size);
+    glGetProgramBinary(ProgramId, Size, @Actual, @H.BinaryFormat, @Data[0]);
+    if (Actual <= 0) or (Actual > Size) then Exit;
+    H.Magic := $31425047; H.DataLength := Actual;
+    H.Digest := MD5Buffer(Data[0], Actual);
+    FileName := ProgramBinaryFile(Key);
+    if not ForceDirectories(ExtractFilePath(FileName)) then Exit;
+    TempName := FileName + '.' + IntToStr(GetProcessID) + '.tmp';
+    Stream := TFileStream.Create(TempName, fmCreate);
+    try
+      Stream.WriteBuffer(H, SizeOf(H));
+      Stream.WriteBuffer(Data[0], Actual);
+    finally Stream.Free; end;
+    if FileExists(FileName) then DeleteFile(FileName);
+    if RenameFile(TempName, FileName) then Inc(BinaryCacheStores);
+    TrimProgramBinaryCache(ExtractFilePath(FileName));
+    if LogShaders then WritelnLog('GLSL binary cache', 'Saved ' + Name);
+  except
+    { Disk cache is optional. }
+  end;
+  if TempName <> '' then DeleteFile(TempName);
+  {$endif}
+end;
 
 { Wrapper around glGetShaderInfoLog. }
 function GetShaderInfoLog(const ShaderId: TGLShader): String;
@@ -1355,6 +1622,7 @@ begin
   FreeAndNil(FUniformLocations);
   FreeAndNil(FAttributeLocations);
   FreeAndNil(FUniformReportedMissing);
+  FreeAndNil(FAttributeReportedMissing);
 
   inherited;
 end;
@@ -1633,6 +1901,10 @@ var
     CompiledInt: TGLint;
     {$endif not CASTLE_WEBGL}
     Compiled: Boolean;
+    PrepareTick, PrepareMs: QWord;
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    TimingStart: QWord;
+    {$endif}
   begin
     Result := glCreateShader(AType);
 
@@ -1654,6 +1926,12 @@ var
     glShaderSource(Result, 1, @SrcPtr, @SrcLength);
     {$endif}
 
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    WritelnLog('StartupTiming', Format('compile begin shader=%d stage=%s bytes=%d name=%s',
+      [Result, ShaderTypeName[ShaderType], Length(S), Name]));
+    TimingStart := GetTickCount64;
+    {$endif}
+    PrepareTick := GetTickCount64;
     try
       glCompileShader(Result);
     except
@@ -1666,6 +1944,14 @@ var
     glGetShaderiv(Result, GL_COMPILE_STATUS, @CompiledInt);
     Compiled := CompiledInt = Ord(GL_TRUE);
     {$endif}
+    PrepareMs := GetTickCount64 - PrepareTick;
+    if PrepareMs > 100 then
+      WritelnLog('ResourcePrepare', 'stage=shader_compile ms=%d shader=%d type=%s bytes=%d name="%s"',
+        [PrepareMs, Result, ShaderTypeName[ShaderType], Length(S), Name]);
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    WritelnLog('StartupTiming', Format('compile end shader=%d ms=%d',
+      [Result, GetTickCount64 - TimingStart]));
+    {$endif}
 
     { Although we generally avoid creating multiline exception messages,
       ShaderGetInfoLog naturally comes out multiline (it contains a
@@ -1675,81 +1961,6 @@ var
       ReportCompileError(GetShaderInfoLog(Result));
   end;
 
-const
-  {$ifdef OpenGLES}
-  GLES30CoreHeader: array [TShaderType] of String = (
-    // vertex
-    '#version 300 es' + NL +
-    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
-    '#define attribute in' + NL +
-    '#define varying out' + NL +
-    '#define texture2D texture' + NL +
-    '#define texture3D texture' + NL +
-    '#define textureCube texture' + NL +
-    '#define texture2DProj textureProj' + NL +
-    '#define texture3DProj textureProj' + NL +
-    { Otherwise each sampler2DShadow would have to contain precision specifier.
-      EXT_shadow_samplers says that lowp is default, so presumably it is OK:
-      https://registry.khronos.org/OpenGL/extensions/EXT/EXT_shadow_samplers.txt }
-    'precision lowp sampler2DShadow;' + NL +
-    { Otherwise each sampler3D would have to contain precision specifier.
-      3D textures are part of OpenGLES 3.0 core, so it's OK to use sampler3D here.
-      Testcase that this is needed: castle-model-viewer, compiled with OpenGLES,
-      viewing demo-models/water/caustics/Barna29.x3dv . }
-    'precision lowp sampler3D;' + NL,
-
-    // geometry - not supported by OpenGLES
-    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL,
-
-    // fragment
-    '#version 300 es' + NL +
-    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
-    '#define varying in' + NL +
-    '#define texture2D texture' + NL +
-    '#define texture3D texture' + NL +
-    '#define textureCube texture' + NL +
-    '#define texture2DProj textureProj' + NL +
-    '#define texture3DProj textureProj' + NL +
-    '#define gl_FragColor castle_FragColor' + NL +
-    'out mediump vec4 castle_FragColor;' + NL +
-    { We need to use highp for shadow maps processing on mobile,
-      to make the shadows look good,
-      see https://github.com/castle-engine/castle-engine/pull/674 }
-    '#define shadowsPrecision highp' + NL +
-    'precision lowp sampler2DShadow;' + NL +
-    'precision lowp sampler3D;' + NL
-  );
-  {$else}
-  GL31CoreHeader: array [TShaderType] of String = (
-    // vertex
-    '#version 140' + NL +
-    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
-    '#define attribute in' + NL +
-    '#define varying out' + NL +
-    '#define texture2D texture' + NL +
-    '#define texture3D texture' + NL +
-    '#define textureCube texture' + NL +
-    '#define texture2DProj textureProj' + NL +
-    '#define texture3DProj textureProj' + NL,
-
-    // geometry
-    '#version 150' + NL +
-    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL,
-
-    // fragment
-    '#version 140' + NL +
-    '#define CASTLE_GLSL_VERSION_UPGRADE' + NL +
-    '#define varying in' + NL +
-    '#define texture2D texture' + NL +
-    '#define texture3D texture' + NL +
-    '#define textureCube texture' + NL +
-    '#define texture2DProj textureProj' + NL +
-    '#define texture3DProj textureProj' + NL +
-    '#define gl_FragColor castle_FragColor' + NL +
-    'out mediump vec4 castle_FragColor;' + NL +
-    '#define shadowsPrecision' + NL
-  );
-  {$endif}
 
   { Does shader code Text has a line starting with LinePrefix. }
   function HasLine(const LinePrefix: String; const Text: String): Boolean;
@@ -2019,9 +2230,22 @@ var
   LinkedInt: TGLuint;
   {$endif}
   Linked: Boolean;
+  PrepareTick, PrepareMs: QWord;
+  {$ifdef REZVIVO_STARTUP_TIMING}
+  TimingStart: QWord;
+  {$endif}
 begin
   if GLFeatures.Shaders then
   begin
+    {$if defined(FPC) and not defined(OpenGLES)}
+    { A binary already linked this program. Still run the virtual Link chain:
+      descendants resolve their uniform and attribute locations after inherited. }
+    if FSaveBinaryRequested and (ShaderIds.Count = 0) then
+    begin
+      glGetProgramiv(ProgramId, GL_LINK_STATUS, @LinkedInt);
+      if LinkedInt = GL_TRUE then Exit;
+    end;
+    {$endif}
     { Produce clear error messages, without waiting for OpenGL errors,
       if required shaders are not attached. }
     if not HasStage[stVertex] then
@@ -2029,6 +2253,15 @@ begin
     if FragmentShaderRequired and (not HasStage[stFragment]) then
       raise EGLSLProgramLinkError.Create('Fragment shader not attached');
 
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    WritelnLog('StartupTiming', Format('link begin program=%d name=%s', [ProgramId, Name]));
+    TimingStart := GetTickCount64;
+    {$endif}
+    {$if defined(FPC) and not defined(OpenGLES)}
+    if FSaveBinaryRequested then
+      glProgramParameteri(ProgramId, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+    {$endif}
+    PrepareTick := GetTickCount64;
     glLinkProgram(ProgramId);
 
     {$ifdef CASTLE_WEBGL}
@@ -2036,6 +2269,14 @@ begin
     {$else}
     glGetProgramiv(ProgramId, GL_LINK_STATUS, @LinkedInt);
     Linked := LinkedInt = Ord(GL_TRUE);
+    {$endif}
+    PrepareMs := GetTickCount64 - PrepareTick;
+    if PrepareMs > 100 then
+      WritelnLog('ResourcePrepare', 'stage=shader_link ms=%d program=%d name="%s"',
+        [PrepareMs, ProgramId, Name]);
+    {$ifdef REZVIVO_STARTUP_TIMING}
+    WritelnLog('StartupTiming', Format('link end program=%d ms=%d name=%s',
+      [ProgramId, GetTickCount64 - TimingStart, Name]));
     {$endif}
 
     if not Linked then
@@ -2073,6 +2314,22 @@ begin
   RenderContext.CurrentProgram := Self;
 end;
 
+procedure ConfigureShaderNameList(const Names: TStringList);
+{$ifdef FPC}
+var WasSorted: Boolean;
+{$endif}
+begin
+  {$ifdef FPC}
+  if Names.UseLocale = UseBinaryShaderNames then
+  begin
+    WasSorted := Names.Sorted;
+    Names.Sorted := False;
+    Names.UseLocale := not UseBinaryShaderNames;
+    Names.Sorted := WasSorted;
+  end;
+  {$endif}
+end;
+
 class procedure TGLSLProgram.Disable;
 begin
   RenderContext.CurrentProgram := nil;
@@ -2103,6 +2360,8 @@ function TGLSLProgram.Uniform(const AName: string; const AUniformMissing: TUnifo
       FUniformReportedMissing := TStringList.Create;
       FUniformReportedMissing.CaseSensitive := true; // GLSL uniform names are case-sensitive
     end;
+    ConfigureShaderNameList(FUniformReportedMissing);
+    FUniformReportedMissing.Sorted := UseBinaryShaderNames;
     // don't spam the log with warning "Uniform variable "%s" not found (or not used)"... every frame
     if FUniformReportedMissing.IndexOf(AName) <> -1 then
       Exit;
@@ -2338,6 +2597,19 @@ end;
 procedure TGLSLProgram.SetUniform(const AName: string; const Value: TMatrix4List);
 begin
   SetUniform(AName, Value, UniformMissing);
+end;
+
+procedure TGLSLProgram.WarnMissingAttribute(const AName: string);
+begin
+  if FAttributeReportedMissing = nil then
+  begin
+    FAttributeReportedMissing := TStringList.Create;
+    FAttributeReportedMissing.CaseSensitive := True;
+  end;
+  if FAttributeReportedMissing.IndexOf(AName) <> -1 then Exit;
+  FAttributeReportedMissing.Add(AName);
+  WritelnWarning('VRML/X3D', 'Shader attribute "' + AName +
+    '" not found (or not used) in ' + Name);
 end;
 
 function TGLSLProgram.AttributeOptional(const AName: string): TGLSLAttribute;

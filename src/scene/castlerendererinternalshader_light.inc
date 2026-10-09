@@ -93,7 +93,6 @@
     { Prepare some stuff for Code generation, update Hash for this light shader. }
     procedure Prepare(var Hash: TShaderCodeHash; const LightNumber: Cardinal);
     function Code: TShaderSource;
-    procedure SetUniformsOnce(AProgram: TX3DShaderProgram);
     procedure SetDynamicUniforms(AProgram: TX3DShaderProgram);
   end;
 
@@ -251,22 +250,17 @@ begin
   Result := FCode;
 end;
 
-procedure TLightShader.SetUniformsOnce(AProgram: TX3DShaderProgram);
-
-  procedure SetEnvironmentLightUniforms(const EnvLight: TEnvironmentLightNode);
-  begin
-    if EnvLight.FdDiffuseTexture.Value <> nil then
-      AProgram.UniformsTextures.Add(EnvLight.FdDiffuseTexture);
-    if EnvLight.FdSpecularTexture.Value <> nil then
-      AProgram.UniformsTextures.Add(EnvLight.FdSpecularTexture);
-  end;
-
-begin
-  if Node is TEnvironmentLightNode then
-    SetEnvironmentLightUniforms(TEnvironmentLightNode(Node));
-end;
-
 procedure TLightShader.SetDynamicUniforms(AProgram: TX3DShaderProgram);
+
+  procedure BindEnvironmentTexture(const Field: TSFNode);
+  begin
+    { Programs are shared by scenes, lights are not. Retaining the first
+      light's field in UniformsTextures leaves a dangling pointer when an
+      avatar is replaced while another draw still uses this program. }
+    if (Field.Value <> nil) and
+       (AProgram.Uniform(Field.X3DName, umIgnore).Location >= 0) then
+      AProgram.SharedUniformsTextures.Add(Field);
+  end;
 var
   Uniforms: TLightUniforms;
   Color3, AmbientColor3: TVector3;
@@ -276,6 +270,11 @@ var
   LiSpot: TSpotLightNode;
   LightToEyeSpace: PMatrix4;
 begin
+  if Node is TEnvironmentLightNode then
+  begin
+    BindEnvironmentTexture(TEnvironmentLightNode(Node).FdDiffuseTexture);
+    BindEnvironmentTexture(TEnvironmentLightNode(Node).FdSpecularTexture);
+  end;
   while Number >= AProgram.FLightUniformsList.Count do
   begin
     Uniforms := TLightUniforms.Create;

@@ -150,6 +150,19 @@
   protected
     procedure GroupBeforeTraverse(const State: TX3DGraphTraverseState; var WasPointingDeviceSensor: Boolean); override;
   public
+    { Opt in before rendering: object-space deformation is independent of
+      camera/pass and may be captured once for all passes of a frame.
+      Runtime-only; do not set for effects with other vertex side effects. }
+    InternalCacheVertexAnimation: Boolean;
+    { Optional immutable source/interface fingerprint, assigned before prepare.
+      Equal keys share a program, but receive this instance's fields per draw.
+      Empty preserves the standard event-bound private-program behaviour. }
+    InternalSharedCodeKey: String;
+    { Opt-in for effects whose runtime writes use Send/Changed. Values are
+      checked again at the next frame even for direct field assignments. }
+    InternalSharedRevisionCache: Boolean;
+    InternalSharedValuesSerial: Int64;
+    procedure InternalSharedValuesChanged;
     constructor Create(const AX3DName: String = ''; const ABaseUrl: String = ''); override;
   {$I auto_generated_node_helpers/x3dnodes_effect.inc}
   end;
@@ -340,8 +353,10 @@
 
     { Update meshes in @link(FdShapes) to reflect the current joints transformation.
       This does the core of "skinned animation" logic.
+      AScene = the scene performing the update (used to disambiguate joint
+      associations when the graph is shared by multiple TCastleScene).
       @exclude }
-    procedure InternalUpdateSkin;
+    procedure InternalUpdateSkin(const AScene: TX3DEventsEngine = nil);
 
     { How is mesh updated from joints, in particular do we use shaders.
       This takes into account InternalFeatures (is current rendering
@@ -494,9 +509,17 @@ end;
 
 { TEffectNode ---------------------------------------------------------------- }
 
+var SharedEffectValueSerial: Int64 = 0;
+
+procedure TEffectNode.InternalSharedValuesChanged;
+begin
+  InternalSharedValuesSerial := InterlockedIncrement64(SharedEffectValueSerial);
+end;
+
 constructor TEffectNode.Create(const AX3DName, ABaseUrl: String);
 begin
   inherited;
+  InternalSharedValuesChanged;
   HasInterfaceDeclarations := AllAccessTypes;
 end;
 
@@ -652,9 +675,10 @@ begin
   inherited;
 end;
 
-procedure TSkinNode.InternalUpdateSkin;
+procedure TSkinNode.InternalUpdateSkin(const AScene: TX3DEventsEngine);
 var
   MeshCalculation: TInternalMeshCalculation;
+
 
   function SceneName: String;
   begin
@@ -676,7 +700,7 @@ var
     function JointParentTransform(const Joint: TX3DNode): PTransformation;
     var
       ShapeTransform: TShapeTreeTransform;
-      C: Integer;
+      C, I: Integer;
     begin
       C := TShapeTree.AssociatedShapesCount(Joint);
 
@@ -697,7 +721,30 @@ var
         ]);
       end;
 
-      ShapeTransform := TShapeTree.AssociatedShape(Joint, 0) as TShapeTreeTransform;
+      { When the graph is shared by several TCastleScene instances (e.g. a
+        rider subtree mounted into the bike's unified scene), the joint has
+        one association per scene, and index 0 may point at a wrapper of a
+        scene that never processes time (stale/identity transformation ->
+        the skin freezes in bind pose). Prefer the wrapper of the scene
+        that performs THIS update (AScene); fall back to the scene that
+        registered this skin node, then to index 0. }
+      ShapeTransform := nil;
+      if (C > 1) and (AScene <> nil) then
+        for I := 0 to C - 1 do
+          if TShapeTree.AssociatedShape(Joint, I).ParentScene = AScene then
+          begin
+            ShapeTransform := TShapeTree.AssociatedShape(Joint, I) as TShapeTreeTransform;
+            Break;
+          end;
+      if (ShapeTransform = nil) and (C > 1) and (Scene <> nil) then
+        for I := 0 to C - 1 do
+          if TShapeTree.AssociatedShape(Joint, I).ParentScene = Scene then
+          begin
+            ShapeTransform := TShapeTree.AssociatedShape(Joint, I) as TShapeTreeTransform;
+            Break;
+          end;
+      if ShapeTransform = nil then
+        ShapeTransform := TShapeTree.AssociatedShape(Joint, 0) as TShapeTreeTransform;
       Result := @ShapeTransform.TransformState.Transformation;
     end;
 

@@ -29,6 +29,10 @@
     GUITexture: boolean;
     References: Cardinal;
     GLName: TGLTexture;
+    { Metadata of the source image, retained with the existing GL cache entry.
+      Reusing a live GPU texture must not require decoding its URL again. }
+    SourceWidth, SourceHeight: Cardinal;
+    SourceAlpha: TAlphaChannel;
   end;
   TTextureImageCacheList = {$ifdef FPC}specialize{$endif} TObjectList<TTextureImageCache>;
 
@@ -110,6 +114,10 @@
       TShapeCache owns this -- it will be freed when TShapeCache is freed. }
     Arrays: TGeometryArrays;
 
+    { Geometry-only preparation for surface queries. The first normal draw
+      replaces the minimal layout through the existing arrays/VBO path. }
+    SurfaceQueryOnly: Boolean;
+
     { What VBOs do we need to reload at next LoadArraysToVbo call.
       This also implies that content for this VBOs needs to be created,
       which may mean we need to change Arrays.
@@ -122,6 +130,15 @@
     VboCoordinatePreserveGeometryOrder: Boolean; //< copied from TGeometryArrays.CoordinatePreserveGeometryOrder
 
     Vao: TVertexArrayObject;
+
+    { GPU-only object-space deformation, shared by colour and shadow draws. }
+    PoseVbo: array[0..1] of TGLBuffer;
+    PoseFrame: QWord;
+    PoseRevision: QWord;
+    PoseSize: Cardinal;
+    PoseRead: Integer;
+    PoseValid, PosePending: Boolean;
+    procedure ClearPose;
 
     { Like TX3DRendererShape.LoadArraysToVbo,
       but takes explicit DynamicGeometry. }
@@ -178,6 +195,7 @@ procedure TShapeCache.GLContextClose;
 var
   I: TVboType;
 begin
+  ClearPose;
   if Vbo[vtCoordinate] <> GLObjectNone then
   begin
     for I := Low(I) to High(I) do
@@ -191,8 +209,21 @@ begin
   FreeAndNil(Vao);
 end;
 
+procedure TShapeCache.ClearPose;
+begin
+  FreeBuffer(PoseVbo[0]);
+  FreeBuffer(PoseVbo[1]);
+  PoseSize := 0;
+  PoseFrame := 0;
+  PoseRead := 0;
+  PoseValid := false;
+  PosePending := false;
+end;
+
 procedure TShapeCache.InvalidateVertexData(const Changed: TVboTypes);
 begin
+  { The old pose cannot be replayed after geometry or weights change. }
+  PoseValid := false;
   VboToReload := VboToReload + Changed;
 end;
 
