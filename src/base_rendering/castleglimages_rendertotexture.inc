@@ -540,10 +540,22 @@ procedure TGLRenderToTexture.GLContextOpen;
 
   function ColorBufferFormat: TGLenum;
   begin
+    {$ifdef OpenGLES}
+    { RenderbufferStorage requires a sized format on GLES. Unsized RGB/RGBA
+      fails on ANGLE and mobile drivers, leaving an incomplete framebuffer. }
+    if GLVersion.AtLeast(3, 0) then
+    begin
+      if ColorBufferAlpha then Result := GL_RGBA8 else Result := GL_RGB8;
+    end else
+    begin
+      if ColorBufferAlpha then Result := GL_RGBA4 else Result := GL_RGB565;
+    end;
+    {$else}
     if ColorBufferAlpha then
       Result := GL_RGBA
     else
       Result := GL_RGB;
+    {$endif}
   end;
 
 var

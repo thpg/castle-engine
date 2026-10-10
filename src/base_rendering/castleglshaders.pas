@@ -2040,7 +2040,20 @@ begin
         if (not HasLine('precision mediump float;', S)) and
            (not HasLine('precision lowp float;', S)) and
            (not HasLine('precision highp float;', S)) then
-          S := 'precision mediump float;' + NL + S;
+        begin
+          { GLES 3 materials use shared camera/world uniforms in both stages.
+            Match the vertex default (highp), also keeping world-space noise
+            stable on mobile GPUs with actual 16-bit mediump arithmetic. }
+          if GLVersion.AtLeast(3, 0) then
+            S := 'precision highp float;' + NL + S
+          else
+            S := 'precision mediump float;' + NL + S;
+        end;
+        if GLVersion.AtLeast(3, 0) and
+           (not HasLine('precision mediump int;', S)) and
+           (not HasLine('precision lowp int;', S)) and
+           (not HasLine('precision highp int;', S)) then
+          S := 'precision highp int;' + NL + S;
         {$endif}
       end;
     {$ifndef COMPILER_CASE_ANALYSIS}
