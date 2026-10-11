@@ -975,7 +975,8 @@ begin
   if FEnabled <> Value then
   begin
     FEnabled := Value;
-    if RenderContext.FEnabledScissors <> nil then
+    { The container clears RenderContext before destroying its global scissor. }
+    if (RenderContext <> nil) and (RenderContext.FEnabledScissors <> nil) then
     begin
       if Value then
         RenderContext.FEnabledScissors.Add(Self) else
