@@ -40,12 +40,38 @@ public class MainActivity extends NativeActivity
        jniLanguage(Locale.getDefault().toString());
     }
 
+    /** Legacy Back dispatch for services that supply native in-app navigation.
+     * Android 13+ services also register OnBackInvokedCallback. */
+    @SuppressWarnings("deprecation") @Override
+    public void onBackPressed() {
+        for (ServiceAbstract service : services) {
+            if (service.onBackPressed()) return;
+        }
+        super.onBackPressed();
+    }
+
     @Override
     public void onDestroy() {
         for (ServiceAbstract service : services) {
             service.onDestroy();
         }
         super.onDestroy();
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(android.view.MotionEvent event) {
+        for (ServiceAbstract service : services) {
+            if (service.onControllerMotionEvent(event)) return true;
+        }
+        return super.dispatchGenericMotionEvent(event);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        for (ServiceAbstract service : services) {
+            if (service.onControllerKeyEvent(event)) return true;
+        }
+        return super.dispatchKeyEvent(event);
     }
 
     @SuppressLint("NewApi") @Override

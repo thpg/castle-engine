@@ -168,6 +168,7 @@ public abstract class ServiceAbstract
         return param == null || param.length() == 0;
     }
 
+    public boolean onBackPressed() { return false; }
     public void onCreate() { }
     public void onDestroy() { }
     public void onWindowFocusChanged(boolean hasFocus) { }
@@ -178,4 +179,6 @@ public abstract class ServiceAbstract
     public void onPause() { }
     public void onNewIntent(Intent intent) { }
     public void onPurchase(AvailableProduct product, String originalJson, String signature) { }
+    public boolean onControllerMotionEvent(android.view.MotionEvent event) { return false; }
+    public boolean onControllerKeyEvent(android.view.KeyEvent event) { return false; }
 }
