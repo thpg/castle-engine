@@ -276,7 +276,22 @@ type
     ProgramId: TGLprogram;
     ShaderIds: TGLShaderList;
     FSaveBinaryRequested: Boolean;
+    {$ifndef CASTLE_WEBGL}
+    type
+      TUniformValueEntry = record
+        Location: TGLint;
+        Kind, Size: Byte;
+        Epoch: QWord;
+        Data: array[0..15] of UInt32;
+      end;
+    var
+      FUniformValueEntries: array[0..63] of TUniformValueEntry;
+      FUniformValueEpoch: QWord;
+    function UploadUniformValue(const Location: TGLint; const Value;
+      const Size, Kind: Byte): Boolean;
+    {$endif}
 
+  private
     FUniformMissing: TUniformMissing;
     FUniformLocations: TUniformLocationCache;
     FAttributeLocations: TAttribLocationCache;
@@ -306,6 +321,10 @@ type
     procedure GLContextClose;
     procedure OnGlContextClose(Sender: TObject);
   public
+    { Opt in only for programs whose uniforms are written through SetValue.
+      Raw glUniform writes must call InvalidateUniformValues first. }
+    CacheUniformValues: Boolean;
+
     { Shader name is used in log messages. Any String is OK. }
     Name: String;
     {$ifdef CASTLE_CANNOT_CATCH_EXCEPTIONS}
@@ -331,6 +350,7 @@ type
       when fragment shader is missing. }
     FragmentShaderRequired: Boolean;
 
+    procedure InvalidateUniformValues;
     constructor Create;
     destructor Destroy; override;
 
@@ -640,6 +660,8 @@ var
   LogShaders: boolean;
   { Diagnostic switch. GLSL identifiers and shader fingerprints are compared
     exactly, not with the user's language-dependent collation rules. }
+  UseProgramUniformCache: Boolean = True;
+  ProgramUniformUploads, ProgramUniformSkips: QWord;
   UseBinaryShaderNames: Boolean = True;
 
 { Configure internal shader-name lists; changing the diagnostic mode also
@@ -1034,28 +1056,17 @@ end;
 
 procedure TGLSLUniform.SetValue(const Value: boolean);
 begin
-  if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
-
-  { GLSL "bool" types are set using the "i" version. From manpage:
-
-    "Either the i or the f variants
-     may be used to provide values for uniform variables of type
-     bool, bvec2, bvec3, bvec4, or arrays of these. The uniform
-     variable will be set to false if the input value is 0 or 0.0f,
-     and it will be set to true otherwise.
-    "
-
-    Which means that I can simply call glUniform1i, with Ord(Value). }
-
-  Owner.Enable;
-  if GLFeatures.Shaders then
-    glUniform1i(Location, Ord(Value));
+  SetValue(TGLint(Ord(Value)));
 end;
 
 procedure TGLSLUniform.SetValue(const Value: TGLint);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 1) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     glUniform1i(Location, Value);
 end;
@@ -1064,6 +1075,10 @@ procedure TGLSLUniform.SetValue(const Value: TVector2Integer);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 1) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniform2i(Location, Value[0], Value[1]);
@@ -1076,6 +1091,10 @@ procedure TGLSLUniform.SetValue(const Value: TVector3Integer);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 1) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniform3i(Location, Value[0], Value[1], Value[2]);
@@ -1088,6 +1107,10 @@ procedure TGLSLUniform.SetValue(const Value: TVector4Integer);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 1) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniform4i(Location, Value[0], Value[1], Value[2], Value[3]);
@@ -1100,6 +1123,10 @@ procedure TGLSLUniform.SetValue(const Value: TGLfloat);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 2) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     glUniform1f(Location, Value);
 end;
@@ -1108,6 +1135,10 @@ procedure TGLSLUniform.SetValue(const Value: TVector2);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 2) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniform2f(Location, Value[0], Value[1]);
@@ -1120,6 +1151,10 @@ procedure TGLSLUniform.SetValue(const Value: TVector3);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 2) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniform3f(Location, Value[0], Value[1], Value[2]);
@@ -1132,6 +1167,10 @@ procedure TGLSLUniform.SetValue(const Value: TVector4);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 2) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniform4f(Location, Value[0], Value[1], Value[2], Value[3]);
@@ -1144,6 +1183,10 @@ procedure TGLSLUniform.SetValue(const Value: TMatrix2);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 3) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniformMatrix2fv(Location, GL_FALSE, MatrixToWebGL(Value), 0, 0);
@@ -1156,6 +1199,10 @@ procedure TGLSLUniform.SetValue(const Value: TMatrix3);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 3) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniformMatrix3fv(Location, GL_FALSE, MatrixToWebGL(Value), 0, 0);
@@ -1168,6 +1215,10 @@ procedure TGLSLUniform.SetValue(const Value: TMatrix4);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Owner.Enable;
+  {$ifndef CASTLE_WEBGL}
+  if GLFeatures.Shaders and
+     not Owner.UploadUniformValue(Location, Value, SizeOf(Value), 3) then Exit;
+  {$endif}
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
     glUniformMatrix4fv(Location, GL_FALSE, MatrixToWebGL(Value), 0, 0);
@@ -1200,6 +1251,7 @@ procedure TGLSLUniform.SetValue(const Value: TInt32List);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
   Assert(SizeOf(Int32) = SizeOf(TGLint));
+  Owner.InvalidateUniformValues;
   Owner.Enable;
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
@@ -1212,6 +1264,7 @@ end;
 procedure TGLSLUniform.SetValue(const Value: TSingleList);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
+  Owner.InvalidateUniformValues;
   Owner.Enable;
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
@@ -1224,6 +1277,7 @@ end;
 procedure TGLSLUniform.SetValue(const Value: TVector2List);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
+  Owner.InvalidateUniformValues;
   Owner.Enable;
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
@@ -1236,6 +1290,7 @@ end;
 procedure TGLSLUniform.SetValue(const Value: TVector3List);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
+  Owner.InvalidateUniformValues;
   Owner.Enable;
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
@@ -1248,6 +1303,7 @@ end;
 procedure TGLSLUniform.SetValue(const Value: TVector4List);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
+  Owner.InvalidateUniformValues;
   Owner.Enable;
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
@@ -1260,6 +1316,7 @@ end;
 procedure TGLSLUniform.SetValue(const Value: TMatrix3List);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
+  Owner.InvalidateUniformValues;
   Owner.Enable;
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
@@ -1272,6 +1329,7 @@ end;
 procedure TGLSLUniform.SetValue(const Value: TMatrix4List);
 begin
   if Location = GLUniformLocationNone then Exit; // ignore non-existing uniform here
+  Owner.InvalidateUniformValues;
   Owner.Enable;
   if GLFeatures.Shaders then
     {$ifdef CASTLE_WEBGL}
@@ -1498,6 +1556,60 @@ end;
 
 { TGLSLProgram --------------------------------------------------------------- }
 
+procedure TGLSLProgram.InvalidateUniformValues;
+begin
+  {$ifndef CASTLE_WEBGL}
+  { Constant time; array uploads can overlap scalar/element uniform handles. }
+  if FUniformValueEpoch = High(QWord) then
+  begin
+    FillChar(FUniformValueEntries, SizeOf(FUniformValueEntries), 0);
+    FUniformValueEpoch := 1;
+  end else
+    Inc(FUniformValueEpoch);
+  {$endif}
+end;
+
+{$ifndef CASTLE_WEBGL}
+function TGLSLProgram.UploadUniformValue(const Location: TGLint;
+  const Value; const Size, Kind: Byte): Boolean;
+var
+  Index: Cardinal;
+begin
+  Result := True;
+  if not CacheUniformValues then
+  begin
+    { A caller may temporarily opt out, then opt back in. Writes made while
+      disabled must not leave the previous cached value valid. }
+    InvalidateUniformValues;
+    Exit;
+  end;
+  if not UseProgramUniformCache then
+  begin
+    InvalidateUniformValues;
+    Inc(ProgramUniformUploads);
+    Exit;
+  end;
+  { Bounded storage even for sparse explicit locations. Hash collisions are
+    misses, never false hits. Compare exact bytes, with no tolerance. }
+  Index := Cardinal(Location) and High(FUniformValueEntries);
+  if (FUniformValueEntries[Index].Epoch = FUniformValueEpoch) and
+     (FUniformValueEntries[Index].Size = Size) and
+     (FUniformValueEntries[Index].Kind = Kind) and
+     (FUniformValueEntries[Index].Location = Location) and
+     CompareMem(@FUniformValueEntries[Index].Data, @Value, Size) then
+  begin
+    Inc(ProgramUniformSkips);
+    Exit(False);
+  end;
+  FUniformValueEntries[Index].Epoch := FUniformValueEpoch;
+  FUniformValueEntries[Index].Location := Location;
+  FUniformValueEntries[Index].Size := Size;
+  FUniformValueEntries[Index].Kind := Kind;
+  Move(Value, FUniformValueEntries[Index].Data, Size);
+  Inc(ProgramUniformUploads);
+end;
+{$endif}
+
 constructor TGLSLProgram.Create;
 {$ifdef CASTLE_COLLECT_SHADER_SOURCE}
 var
@@ -1537,6 +1649,7 @@ end;
 
 procedure TGLSLProgram.GLContextClose;
 begin
+  InvalidateUniformValues;
   { This is called from destructor,
     which may be called if exception is raised from constructor,
     so be careful to check here things -- e.g. check that
@@ -2248,6 +2361,7 @@ var
   TimingStart: QWord;
   {$endif}
 begin
+  InvalidateUniformValues;
   if GLFeatures.Shaders then
   begin
     {$if defined(FPC) and not defined(OpenGLES)}

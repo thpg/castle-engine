@@ -51,6 +51,11 @@ type
     Provides some extra features, above the standard TGLSLProgram,
     but does not require to link the shader using TShader algorithm. }
   TX3DShaderProgramBase = class(TGLSLProgram)
+  private
+    FTexCoordAttributes: array of TGLSLAttribute;
+    FNormalModelView: TMatrix4;
+    FNormalMatrix: TMatrix3;
+    FNormalMatrixValid: Boolean;
   public
     { Uniforms initialized after linking.
       Initializing them only once after linking allows the mesh renderer to go fast. }
@@ -80,6 +85,8 @@ type
     AttributeCastle_SkinWeights0,
     AttributeCastle_SkinJoints0: TGLSLAttribute;
 
+    function TextureCoordinateAttribute(const Index: Integer): TGLSLAttribute;
+    procedure SetNormalMatrix(const ModelView: TMatrix4);
     procedure Link; override;
   end;
 
@@ -687,7 +694,12 @@ function SharedUniformValuesEqual(const A, B: TX3DField): Boolean;
 var
   UseFastShadowShaders: Boolean = True;
   UseSeparateShadowProgramCache: Boolean = True;
+  UseStackMeshAttributes: Boolean = True;
+  UseCachedMeshBindings: Boolean = True;
+  NormalMatrixCalculations, NormalMatrixReuses: QWord;
   UseCachedRiderMeshes: Boolean = True;
+  { A ray-query consumer needs the exact posed buffer from a camera pass. }
+  RequireDeformedMeshBuffers: Boolean = False;
   UseDelayedRiderMeshes: Boolean = False;
   UseSharedUniformArrayCache: Boolean = True;
   UseSharedEffectBindings: Boolean = True;
@@ -919,8 +931,36 @@ end;
 
 { TX3DShaderProgramBase ------------------------------------------------------ }
 
+function TX3DShaderProgramBase.TextureCoordinateAttribute(const Index: Integer): TGLSLAttribute;
+begin
+  if not UseCachedMeshBindings then
+    Exit(AttributeOptional('castle_MultiTexCoord' + IntToStr(Index)));
+  if Index >= Length(FTexCoordAttributes) then
+    SetLength(FTexCoordAttributes, Max(Index + 1, Length(FTexCoordAttributes) * 2));
+  if FTexCoordAttributes[Index].Owner = nil then
+    FTexCoordAttributes[Index] := AttributeOptional('castle_MultiTexCoord' + IntToStr(Index));
+  Result := FTexCoordAttributes[Index];
+end;
+
+procedure TX3DShaderProgramBase.SetNormalMatrix(const ModelView: TMatrix4);
+begin
+  if (not UseCachedMeshBindings) or (not FNormalMatrixValid) or
+     not CompareMem(@FNormalModelView, @ModelView, SizeOf(ModelView)) then
+  begin
+    FNormalModelView := ModelView;
+    FNormalMatrix := ModelViewToNormalMatrix(ModelView);
+    FNormalMatrixValid := True;
+    Inc(NormalMatrixCalculations);
+  end else
+    Inc(NormalMatrixReuses);
+  UniformCastle_NormalMatrix.SetValue(FNormalMatrix);
+end;
+
 procedure TX3DShaderProgramBase.Link;
 begin
+  FTexCoordAttributes := nil;
+  FNormalMatrixValid := False;
+  CacheUniformValues := True;
   inherited;
 
   UniformCastle_ModelViewMatrix       := Uniform('castle_ModelViewMatrix'      , umIgnore);

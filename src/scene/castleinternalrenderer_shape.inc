@@ -49,6 +49,10 @@
       by the renderer and must be refreshed after a context/cache rebuild. }
     function SurfaceQueryBuffers(out Coordinates, Indices: TGLBuffer;
       out Stride, VertexCount, IndexCount: Cardinal): Boolean;
+    { Exact vertices selected by the last draw, including cached GPU skinning.
+      Query immediately after rendering; buffers remain owned by the shape. }
+    function DeformedQueryBuffers(out Coordinates, Indices: TGLBuffer;
+      out Stride, VertexCount, IndexCount: Cardinal; out Posed: Boolean): Boolean;
     { Prepare only static indexed geometry in the native cache, without
       textures, shaders or drawing. Call on the GL thread on a query miss. }
     function PrepareSurfaceQueryBuffers(const RenderOptions: TCastleRenderOptions): Boolean;
@@ -100,6 +104,28 @@ begin
   Coordinates := Cache.Vbo[vtCoordinate]; Indices := Cache.Vbo[vtIndex];
   Stride := Cache.Arrays.CoordinateSize;
   VertexCount := Cache.Arrays.Count; IndexCount := Cache.Arrays.IndexesCount;
+end;
+
+function TX3DRendererShape.DeformedQueryBuffers(out Coordinates, Indices: TGLBuffer;
+  out Stride, VertexCount, IndexCount: Cardinal; out Posed: Boolean): Boolean;
+begin
+  Coordinates:=0;Indices:=0;Stride:=0;VertexCount:=0;IndexCount:=0;Posed:=false;
+  Result:=(Cache<>nil) and (Cache.Arrays<>nil) and (Cache.Vbo[vtCoordinate]<>0) and
+    (Cache.Arrays.Primitive=gpTriangles) and (Cache.VboToReload=[]);
+  if not Result then Exit;
+  Posed:=Cache.PoseValid;
+  { A rigid attachment (e.g. the helmet) can inherit a Skin traversal node
+    without belonging to its animated shapes. Its ordinary vertex buffer is
+    already the rendered geometry; waiting for a posed buffer would omit it
+    from ray queries. Only GPU-skinned geometry needs a deformation cache. }
+  if State.SkinnedAnimatedShape and Cache.Arrays.HasSkinWeights0 and
+     Cache.Arrays.HasSkinJoints0 and (State.Skin.InternalMeshCalculation<>mcCpu) and
+     not Posed then Exit(false);
+  Coordinates:=Cache.Vbo[vtCoordinate];Stride:=Cache.Arrays.CoordinateSize;
+  VertexCount:=Cache.Arrays.Count;
+  if Posed then begin Coordinates:=Cache.PoseVbo[Cache.PoseRead];Stride:=10*SizeOf(Single);end;
+  if Cache.Arrays.HasIndexes then begin Indices:=Cache.Vbo[vtIndex];IndexCount:=Cache.Arrays.IndexesCount;end
+  else IndexCount:=VertexCount;
 end;
 
 function TX3DRendererShape.PrepareSurfaceQueryBuffers(

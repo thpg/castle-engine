@@ -114,6 +114,10 @@
       TShapeCache owns this -- it will be freed when TShapeCache is freed. }
     Arrays: TGeometryArrays;
 
+    { Small CPU hierarchy over unchanged indexed triangle ranges, only
+      present on static geometry explicitly marked by its producer. }
+    IndexRangeCulling: TStaticMeshIndexRanges;
+
     { Geometry-only preparation for surface queries. The first normal draw
       replaces the minimal layout through the existing arrays/VBO path. }
     SurfaceQueryOnly: Boolean;
@@ -186,6 +190,7 @@ end;
 
 destructor TShapeCache.Destroy;
 begin
+  FreeAndNil(IndexRangeCulling);
   FreeAndNil(Arrays);
   GLContextClose;
   inherited;
@@ -195,6 +200,7 @@ procedure TShapeCache.GLContextClose;
 var
   I: TVboType;
 begin
+  FreeAndNil(IndexRangeCulling);
   ClearPose;
   if Vbo[vtCoordinate] <> GLObjectNone then
   begin
@@ -222,6 +228,7 @@ end;
 
 procedure TShapeCache.InvalidateVertexData(const Changed: TVboTypes);
 begin
+  FreeAndNil(IndexRangeCulling);
   { The old pose cannot be replayed after geometry or weights change. }
   PoseValid := false;
   VboToReload := VboToReload + Changed;
@@ -314,6 +321,27 @@ var
   end;
 
 begin
+  { Build from the final arrays, not the source IndexedFaceSet: the arrays
+    generator may duplicate/remap vertices for normals or UV seams. Keep
+    triangle/index order intact for surface queries. Opted-in shaders must
+    not use gl_PrimitiveID (each separate draw restarts that counter).
+    Bounds are also created while the A/B switch is off, so switching on
+    never requires VBO regeneration or synchronous readback. }
+  FreeAndNil(IndexRangeCulling);
+  { The individual-draw fallback was slower in measurements. GLES and
+    desktop drivers without multi-draw keep the original single draw and
+    do not pay the hierarchy's construction or memory cost. }
+  {$ifndef OpenGLES}
+  if GLFeatures.VertexBufferObject and Assigned(glMultiDrawElements) and
+     (not DynamicGeometry) and (Geometry <> nil) and
+     Geometry.MetadataBoolean['castle.staticIndexRangeCulling'] and
+     (Arrays <> nil) and (not Arrays.DataFreed) and
+     (Arrays.Primitive = gpTriangles) and (Arrays.Counts = nil) and
+     (Arrays.Indexes <> nil) and (Arrays.Indexes.Count >= 4096 * 3) then
+    IndexRangeCulling := TStaticMeshIndexRanges.Create(Arrays,
+      Geometry.MetadataDouble['castle.staticIndexRangePadding']);
+  {$endif}
+
   if GLFeatures.VertexBufferObject then
   begin
     { In case of VBO not supported (ancient GPUs), we do not free data in Arrays,

@@ -186,14 +186,51 @@ end;
 procedure TBaseCoordinateRenderer.Render;
 var
   Attribs: TGLSLAttributeList;
+  EnabledLocations: array[0..63] of TGLint;
+  EnabledCount: Integer;
+  EnabledMask: QWord;
+
+  procedure TrackAttribute(const A: TGLSLAttribute);
+  var
+    Offset: TGLSLAttribute.TLocationOffset;
+    L: TGLint;
+    Bit: QWord;
+  begin
+    if A.Location = GLAttribLocationNone then Exit;
+    if not UseStackMeshAttributes then
+    begin
+      if Attribs = nil then Attribs := TGLSLAttributeList.Create;
+      Attribs.Add(A);
+      Exit;
+    end;
+    for Offset := Low(Offset) to High(Offset) do
+      if A.LocationOffsetsToDisable[Offset] then
+      begin
+        L := A.Location + Offset;
+        if (L >= 0) and (L < 64) then
+        begin
+          Bit := QWord(1) shl L;
+          if EnabledMask and Bit = 0 then
+          begin
+            EnabledMask := EnabledMask or Bit;
+            EnabledLocations[EnabledCount] := L;
+            Inc(EnabledCount);
+          end;
+        end else
+        begin
+          { No attribute-count limit: uncommon large locations use the old list. }
+          if Attribs = nil then Attribs := TGLSLAttributeList.Create;
+          Attribs.Add(A);
+          Break;
+        end;
+      end;
+  end;
 
   procedure EnableVertexAttrib(GLSLProgram: TGLSLProgram);
   var
     I: Integer;
     A: TGLSLAttribute;
   begin
-    if Attribs = nil then
-      Attribs := TGLSLAttributeList.Create;
     for I := 0 to Arrays.Attribs.Count - 1 do
     begin
       A := GLSLProgram.AttributeOptional(Arrays.Attribs[I].Name);
@@ -222,7 +259,7 @@ var
         else raise EInternalError.Create('Arrays.Attribs[I].AType?');
         {$endif}
       end;
-      Attribs.Add(A);
+      TrackAttribute(A);
     end;
   end;
 
@@ -265,6 +302,9 @@ var
       {$endif}
     end;
 
+    if GLFeatures.Shaders then
+      for I := 0 to EnabledCount - 1 do
+        glDisableVertexAttribArray(EnabledLocations[I]);
     if Attribs <> nil then
     begin
       for I := 0 to Attribs.Count - 1 do
@@ -365,7 +405,7 @@ var
     P: TX3DShaderProgram;
     Frame: QWord;
     Revision: QWord;
-    RevisionDriven, CaptureNeeded: Boolean;
+    RevisionDriven, CaptureNeeded, ReturningAfterGap: Boolean;
     WriteIndex: Integer;
   {$endif}
   begin
@@ -381,15 +421,20 @@ var
     if P.CachedDeformation then P.SetUniform('castle_DeformationMode', 0);
     if not (UseCachedRiderMeshes and P.CachedDeformation and
       (Vbo[vtCoordinate] <> GLObjectNone) and (C.References = 1) and
-      (RevisionDriven or (Renderer.RenderingCamera.Target = rtShadowMap) or
+      (RequireDeformedMeshBuffers or RevisionDriven or (Renderer.RenderingCamera.Target = rtShadowMap) or
         (C.PoseFrame = Frame))) then
     begin
       if C.PoseSize <> 0 then C.ClearPose;
       Exit;
     end;
 
-    if (not C.PoseValid) or (C.PoseSize <> Arrays.Count * PoseStride) or
-      ((not RevisionDriven) and (C.PoseFrame <> Frame) and (C.PoseFrame + 1 <> Frame)) then
+    { Leaving the frustum invalidates the current pose, not its storage.
+      Preserve both VBOs across missed frames and refresh before reusing them.
+      Revision-driven meshes also refresh once on return: an offscreen pose
+      must not be displayed for one frame even when delayed capture is enabled. }
+    ReturningAfterGap := C.PoseValid and (C.PoseFrame <> Frame) and
+      (C.PoseFrame + 1 <> Frame);
+    if (not C.PoseValid) or (C.PoseSize <> Arrays.Count * PoseStride) then
     begin
       C.ClearPose;
       C.PoseSize := Arrays.Count * PoseStride;
@@ -405,9 +450,9 @@ var
     end;
 
     if RevisionDriven then
-      CaptureNeeded := (not C.PoseValid) or (C.PoseRevision <> Revision)
+      CaptureNeeded := ReturningAfterGap or (not C.PoseValid) or (C.PoseRevision <> Revision)
     else
-      CaptureNeeded := C.PoseFrame <> Frame;
+      CaptureNeeded := (not C.PoseValid) or (C.PoseFrame <> Frame);
     if C.PoseFrame <> Frame then
     begin
       C.PoseFrame := Frame;
@@ -433,7 +478,7 @@ var
         glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
       end;
       Inc(CachedMeshCaptures);
-      if C.PoseValid and UseDelayedRiderMeshes then
+      if C.PoseValid and UseDelayedRiderMeshes and not ReturningAfterGap then
         { Same-context GPU commands order feedback writes before vertex
           fetch. Do not poll a fence here: it would skip pose updates when
           the CPU submits frames ahead of the GPU. }
@@ -444,6 +489,7 @@ var
           ordered, so vertex fetch sees the completed feedback writes. }
         C.PoseRead := WriteIndex;
         C.PoseValid := true;
+        C.PosePending := false;
       end;
     end;
 
@@ -473,11 +519,18 @@ var
   Mode: TGLenum;
   TexCoordAttrib: TGLSLAttribute;
   ProfileStarted: TTimerResult;
+  RangeCulling: TStaticMeshIndexRanges;
+  DrawRange: TMeshIndexRange;
+  RangeFrustum: TFrustum;
+  MeshDrawCalls: Cardinal;
+  MultiRangeDraw: Boolean;
   {$ifdef REZVIVO_STARTUP_TIMING}
   TimingStart: QWord;
   {$endif}
 begin
   Attribs := nil;
+  EnabledCount := 0;
+  EnabledMask := 0;
 
   if ProfileSharedEffects then ProfileStarted := Timer;
   RenderCoordinateBegin;
@@ -510,25 +563,23 @@ begin
             Shader.SceneTransform * Shape.State.Transformation.Transform);
         CurrentMeshShader.UniformCastle_ProjectionMatrix.SetValue(RenderContext.ProjectionMatrix);
         if Shader.NeedsNormals then
-          CurrentMeshShader.UniformCastle_NormalMatrix.SetValue(ModelViewToNormalMatrix(ShapeModelView));
+          CurrentMeshShader.SetNormalMatrix(ShapeModelView);
 
         FinalizeLightingModel;
 
-        Attribs := TGLSLAttributeList.Create;
-
         CurrentMeshShader.AttributeCastle_Vertex.EnableArrayVector3(Vao, Arrays.CoordinateSize, PtrUInt(Arrays.Position));
-        Attribs.Add(CurrentMeshShader.AttributeCastle_Vertex);
+        TrackAttribute(CurrentMeshShader.AttributeCastle_Vertex);
 
         if Shader.NeedsNormals then
         begin
           CurrentMeshShader.AttributeCastle_Normal.EnableArrayVector3(Vao, Arrays.CoordinateSize, PtrUInt(Arrays.Normal));
-          Attribs.Add(CurrentMeshShader.AttributeCastle_Normal);
+          TrackAttribute(CurrentMeshShader.AttributeCastle_Normal);
         end;
 
         if Arrays.HasTangent then
         begin
           CurrentMeshShader.AttributeCastle_Tangent.EnableArrayVector4(Vao, Arrays.CoordinateSize, PtrUInt(Arrays.Tangent));
-          Attribs.Add(CurrentMeshShader.AttributeCastle_Tangent);
+          TrackAttribute(CurrentMeshShader.AttributeCastle_Tangent);
         end;
       end else
       begin
@@ -558,13 +609,13 @@ begin
             ctRgbAlpha: CurrentMeshShader.AttributeCastle_ColorPerVertex.EnableArrayVector4(Vao, Arrays.AttributeSize, PtrUInt(Arrays.ColorRgbAlpha));
             else ;
           end;
-          Attribs.Add(CurrentMeshShader.AttributeCastle_ColorPerVertex);
+          TrackAttribute(CurrentMeshShader.AttributeCastle_ColorPerVertex);
         end;
 
         if Arrays.HasFogCoord then
         begin
           CurrentMeshShader.AttributeCastle_FogCoord.EnableArraySingle(Vao, Arrays.AttributeSize, PtrUInt(Arrays.FogCoord));
-          Attribs.Add(CurrentMeshShader.AttributeCastle_FogCoord);
+          TrackAttribute(CurrentMeshShader.AttributeCastle_FogCoord);
         end;
 
         if Shader.NeedsSkinWeightsJoints then
@@ -576,21 +627,19 @@ begin
           Assert(Arrays.HasSkinJoints0);
           CurrentMeshShader.AttributeCastle_SkinWeights0.EnableArrayVector4(Vao, Arrays.AttributeSize, PtrUInt(Arrays.SkinWeights0));
           CurrentMeshShader.AttributeCastle_SkinJoints0.EnableArrayVector4(Vao, Arrays.AttributeSize, PtrUInt(Arrays.SkinJoints0));
-          Attribs.Add(CurrentMeshShader.AttributeCastle_SkinWeights0);
-          Attribs.Add(CurrentMeshShader.AttributeCastle_SkinJoints0);
+          TrackAttribute(CurrentMeshShader.AttributeCastle_SkinWeights0);
+          TrackAttribute(CurrentMeshShader.AttributeCastle_SkinJoints0);
         end;
 
         for I := 0 to Arrays.TexCoords.Count - 1 do
           if (Arrays.TexCoords[I] <> nil) and
              (Arrays.TexCoords[I].Generation = tgExplicit) then
           begin
-            // TODO: would be faster to not query GLSLProgram.Attribute every frame,
-            // but save it in GLSLProgram.
-            TexCoordAttrib := CurrentMeshShader.AttributeOptional('castle_MultiTexCoord' + IntToStr(I));
+            TexCoordAttrib := CurrentMeshShader.TextureCoordinateAttribute(I);
             if TexCoordAttrib.Location = -1 then Continue;
             TexCoordAttrib.EnableArray(Vao, 0, Arrays.TexCoords[I].Dimensions, GL_FLOAT, GL_FALSE,
               Arrays.AttributeSize, PtrUInt(Arrays.TexCoord(I, 0)));
-            Attribs.Add(TexCoordAttrib);
+            TrackAttribute(TexCoordAttrib);
           end;
       end else
       begin
@@ -667,6 +716,7 @@ begin
 
       Mode := ToMode[Arrays.Primitive];
       First := 0;
+      MeshDrawCalls := 0;
       if Arrays.HasIndexes then
       begin
         if Vbo[vtIndex] <> GLObjectNone then
@@ -676,25 +726,79 @@ begin
         end;
 
         if Arrays.Counts = nil then
-          glDrawElements(Mode, Arrays.IndexesCount,
-            GLIndexConst, Pointer(Arrays.IndexesPtr(First)))
+        begin
+          RangeCulling := Shape.Cache.IndexRangeCulling;
+          MultiRangeDraw := False;
+          {$ifndef OpenGLES}
+          MultiRangeDraw := (Vbo[vtIndex] <> GLObjectNone) and
+            Assigned(glMultiDrawElements);
+          {$endif}
+          if UseStaticIndexRangeCulling and MultiRangeDraw and
+             (RangeCulling <> nil) and
+             (Arrays.Primitive = gpTriangles) and
+             (RangeCulling.IndexCount = Arrays.IndexesCount) then
+          begin
+            { The active projection contains each world-cache layer's near
+              and far planes. Never reuse the main camera's frustum here:
+              reflections, shadow maps and editor views have their own. }
+            RangeFrustum.Init(RenderContext.ProjectionMatrix, ShapeModelView);
+            RangeCulling.Select(RangeFrustum, StaticIndexCullMergeGapTriangles,
+              StaticIndexCullMultiDrawMaxRanges);
+            {$ifndef OpenGLES}
+            if MultiRangeDraw and (RangeCulling.RangeCount > 1) then
+            begin
+              glMultiDrawElements(Mode, PGLsizei(RangeCulling.DrawCounts),
+                GLIndexConst, RangeCulling.DrawOffsets, RangeCulling.RangeCount);
+              MeshDrawCalls := 1;
+            end else
+            {$endif}
+            begin
+              for I := 0 to RangeCulling.RangeCount - 1 do
+              begin
+                DrawRange := RangeCulling.Ranges[I];
+                glDrawElements(Mode, DrawRange.Count, GLIndexConst,
+                  Pointer(Arrays.IndexesPtr(DrawRange.First)));
+              end;
+              MeshDrawCalls := RangeCulling.RangeCount;
+            end;
+            Inc(StaticIndexCullPasses);
+            Inc(StaticIndexCullCandidateIndices, Arrays.IndexesCount);
+            Inc(StaticIndexCullSubmittedIndices, RangeCulling.SelectedIndexCount);
+            Inc(StaticIndexCullDrawCalls, MeshDrawCalls);
+            Inc(StaticIndexCullTestedNodes, RangeCulling.TestedNodes);
+          end else
+          begin
+            glDrawElements(Mode, Arrays.IndexesCount,
+              GLIndexConst, Pointer(Arrays.IndexesPtr(First)));
+            MeshDrawCalls := 1;
+          end;
+        end
         else
+        begin
           for I := 0 to Arrays.Counts.Count - 1 do
           begin
             glDrawElements(Mode, Arrays.Counts[I],
               GLIndexConst, Pointer(Arrays.IndexesPtr(First)));
             First := First + Arrays.Counts[I];
           end;
+          MeshDrawCalls := Arrays.Counts.Count;
+        end;
       end else
       begin
         if Arrays.Counts = nil then
-          glDrawArrays(Mode, First, Arrays.Count)
+        begin
+          glDrawArrays(Mode, First, Arrays.Count);
+          MeshDrawCalls := 1;
+        end
         else
+        begin
           for I := 0 to Arrays.Counts.Count - 1 do
           begin
             glDrawArrays(Mode, First, Arrays.Counts[I]);
             First := First + Arrays.Counts[I];
           end;
+          MeshDrawCalls := Arrays.Counts.Count;
+        end;
       end;
 
       {$ifdef REZVIVO_STARTUP_TIMING}
@@ -707,10 +811,7 @@ begin
         ProfileStarted := Timer;
       end;
       { update Renderer.Statistics.DrawCalls }
-      if Arrays.Counts = nil then
-        Inc(Renderer.Statistics^.DrawCalls)
-      else
-        Inc(Renderer.Statistics^.DrawCalls, Arrays.Counts.Count);
+      Inc(Renderer.Statistics^.DrawCalls, MeshDrawCalls);
 
       { We disable arrays explicitly. We could alternatively try
         glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT), but

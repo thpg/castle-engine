@@ -1,5 +1,3 @@
-{ -*- buffer-read-only: t -*- }
-{ DON'T EDIT -- this file was automatically generated from "source/tone_mapping.fs" }
 '/*' + LineEnding +
 '  Copyright 2020-2020 glTF-Sample-Viewer and Michalis Kamburelis.' + LineEnding +
 '' + LineEnding +

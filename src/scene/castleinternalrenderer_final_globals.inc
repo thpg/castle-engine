@@ -51,6 +51,20 @@ const
   DefaultDepthRange = drFar;
 
 var
+  { Experimental opt-in static geometry (metadata castle.staticIndexRangeCulling).
+    Disabled by default: traversal cost can offset saved vertex shader work.
+    Runtime A/B preserves the original VBOs and prepared bounds. }
+  UseStaticIndexRangeCulling: Boolean = False;
+  { Optional conservative overdraw experiment. Zero keeps every rejected
+    gap; e.g. 512 bridges gaps of at most 512 invisible triangles. }
+  StaticIndexCullMergeGapTriangles: Cardinal = 0;
+  StaticIndexCullMultiDrawMaxRanges: Integer = 1024;
+  StaticIndexCullPasses: QWord = 0;
+  StaticIndexCullCandidateIndices: QWord = 0;
+  StaticIndexCullSubmittedIndices: QWord = 0;
+  StaticIndexCullDrawCalls: QWord = 0;
+  StaticIndexCullTestedNodes: QWord = 0;
+
   { Log renderer cache events. Allows to see how the cache performs.
     A @italic(lot) of log messages.
 
