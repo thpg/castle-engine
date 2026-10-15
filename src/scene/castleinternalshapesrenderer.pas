@@ -47,6 +47,10 @@ type
   public
     { Optional borrowed filter; checked before allocating a collected entry. }
     ShapeFilter: TCollectedShapeFilter;
+    { Optional owning collector for a later transparent pass. Redirect only
+      native blended shapes, retaining their exact matrices and render options.
+      The caller restores this pointer before any nested depth capture. }
+    DeferredBlending: TShapesCollector;
     constructor Create(const OwnsObjects: Boolean);
     destructor Destroy; override;
 
@@ -258,7 +262,12 @@ begin
   NewCollected.DepthRange := DepthRange;
   NewCollected.ShadowVolumesReceiver := ShadowVolumesReceiver;
   NewCollected.ShadowCatcher := ShadowCatcher;
-  FCollected.Add(NewCollected);
+  if (DeferredBlending <> nil) and NewCollected.UseBlending then
+  begin
+    Assert(DeferredBlending <> Self);
+    DeferredBlending.FCollected.Add(NewCollected);
+  end else
+    FCollected.Add(NewCollected);
 end;
 
 procedure TShapesCollector.AddFiltered(const Source: TShapesCollector;

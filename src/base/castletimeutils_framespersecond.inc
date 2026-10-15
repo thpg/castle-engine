@@ -162,6 +162,12 @@ type
       (InternalUpdateBegin). }
     procedure ZeroNextSecondsPassed;
 
+    { Override the delta of the current update, without changing FPS measurements.
+      An offline frame recorder calls this from a front-most UI control before
+      the remaining controls and scenes update. Zero holds an unconsumed frame.
+      The next InternalUpdateBegin resumes ordinary wall-clock measurement. }
+    procedure OverrideSecondsPassed(const Value: TFloatTime);
+
     { Time of last Update call. }
     property UpdateStartTime: TTimerResult read FUpdateStartTime;
 
@@ -320,6 +326,11 @@ end;
 procedure TFramesPerSecond.ZeroNextSecondsPassed;
 begin
   DoZeroNextSecondsPassed := true;
+end;
+
+procedure TFramesPerSecond.OverrideSecondsPassed(const Value: TFloatTime);
+begin
+  FSecondsPassed := Max(0.0, Value);
 end;
 
 class function TFramesPerSecond.FrameId: TFrameId;
