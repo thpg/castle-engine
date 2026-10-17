@@ -115,7 +115,7 @@ type
     Items: array of TSharedEffectBinding;
     LastValuesSerial: Int64;
     LastFrame, LastMutation: QWord;
-    HasTextures: Boolean;
+    HasTextures, HasAliasedValues: Boolean;
   end;
 
   TX3DShaderProgram = class(TX3DShaderProgramBase)
@@ -129,9 +129,12 @@ type
     SharedUniformValues: TStringList;
     SharedEffectLayouts: TStringList;
     SharedValuesMutation: QWord;
-    procedure ApplySharedEffectCached(const Node: TEffectNode);
-    procedure ApplySharedEffect(const Node: TX3DNode);
-    procedure ApplySharedEffects(const Nodes: TMFNode);
+    procedure ApplySharedEffectCached(const Node: TEffectNode;
+      const SkipDeformationValues: Boolean = False);
+    procedure ApplySharedEffect(const Node: TX3DNode;
+      const SkipDeformationUniforms: Boolean = False);
+    procedure ApplySharedEffects(const Nodes: TMFNode;
+      const SkipDeformationUniforms: Boolean = False);
 
     { Set uniform variable from VRML/X3D field value.
       Uniform name is contained in UniformName. UniformValue indicates
@@ -638,7 +641,8 @@ type
     { Set uniforms that should be set each time before using shader
       (because changes to their values may happen at any time,
       and they do not cause rebuilding the shader). }
-    procedure SetDynamicUniforms(AProgram: TX3DShaderProgram);
+    procedure SetDynamicUniforms(AProgram: TX3DShaderProgram;
+      const SkipDeformationUniforms: Boolean = False);
 
     { Add a screen effect GLSL code. }
     procedure AddScreenEffectCode(const Depth: boolean);
@@ -705,6 +709,7 @@ var
   UseSharedEffectBindings: Boolean = True;
   UseSharedEffectRevisionCache: Boolean = True;
   CachedMeshCaptures, CachedMeshDraws: QWord;
+  SharedDeformationSkips: QWord;
   ProfileSharedEffects: Boolean = False;
   SharedEffectCalls, SharedEffectFields, SharedEffectUploads: QWord;
   SharedEffectSeconds, DynamicUniformSeconds: Double;
@@ -1337,8 +1342,9 @@ begin
   Result:=False;
 end;
 
-procedure TX3DShaderProgram.ApplySharedEffectCached(const Node:TEffectNode);
-var Layout:TSharedEffectBindings;I,J,N:Integer;Field:TX3DField;U:TGLSLUniform;
+procedure TX3DShaderProgram.ApplySharedEffectCached(const Node:TEffectNode;
+  const SkipDeformationValues:Boolean);
+var Layout,Other:TSharedEffectBindings;I,J,K,L,N:Integer;Field:TX3DField;U:TGLSLUniform;
   SkipValues:Boolean;
   Started: TTimerResult;
 begin
@@ -1365,6 +1371,17 @@ begin
           if J<0 then J:=SharedUniformValues.AddObject(Field.X3DName,
             TX3DFieldClass(Field.ClassType).CreateUndefined(nil,False,Field.X3DName));
           Layout.Items[N].CachedValue:=TX3DField(SharedUniformValues.Objects[J]);
+          { Most effects have disjoint uniform names (pose, cloth, skin,
+            occlusion). An upload by one must not invalidate every other
+            effect. Detect aliases once when constructing the layout; only
+            these layouts need the conservative program-wide mutation guard. }
+          for K:=0 to SharedEffectLayouts.Count-1 do begin
+            Other:=TSharedEffectBindings(SharedEffectLayouts.Objects[K]);
+            for L:=0 to High(Other.Items) do
+              if Other.Items[L].CachedValue=Layout.Items[N].CachedValue then begin
+                Layout.HasAliasedValues:=True;Other.HasAliasedValues:=True;Break;
+              end;
+          end;
         end else Layout.HasTextures:=True;
         Inc(N);
       end;
@@ -1372,10 +1389,10 @@ begin
       SharedEffectLayouts.AddObject(Node.InternalSharedCodeKey,Layout);
     except Layout.Free;raise end;
   end;
-  SkipValues:=UseSharedEffectRevisionCache and Node.InternalSharedRevisionCache and
+  SkipValues:=SkipDeformationValues or (UseSharedEffectRevisionCache and Node.InternalSharedRevisionCache and
     (Layout.LastValuesSerial=Node.InternalSharedValuesSerial) and
     (Layout.LastFrame=TFramesPerSecond.FrameId) and
-    (Layout.LastMutation=SharedValuesMutation);
+    (not Layout.HasAliasedValues or (Layout.LastMutation=SharedValuesMutation)));
   if SkipValues and not Layout.HasTextures then Exit;
   for I:=0 to High(Layout.Items)do begin
     if SkipValues and (Layout.Items[I].CachedValue<>nil) then Continue;
@@ -1399,23 +1416,49 @@ begin
       SharedUploadSeconds := SharedUploadSeconds + TimerSeconds(Timer, Started);
     Layout.Items[I].Initialized:=True;
   end;
+  if SkipDeformationValues then Exit;
   Layout.LastValuesSerial:=Node.InternalSharedValuesSerial;
   Layout.LastFrame:=TFramesPerSecond.FrameId;
   Layout.LastMutation:=SharedValuesMutation;
 end;
 
-procedure TX3DShaderProgram.ApplySharedEffect(const Node: TX3DNode);
+procedure TX3DShaderProgram.ApplySharedEffect(const Node: TX3DNode;
+  const SkipDeformationUniforms: Boolean);
 var I, Index: Integer; Field, Cached: TX3DField; Key: String; Started: TTimerResult;
 begin
   if not (Node is TEffectNode) or
      (TEffectNode(Node).InternalSharedCodeKey = '') or
      not TEffectNode(Node).Enabled or (Node.InterfaceDeclarations = nil) then Exit;
+  if SkipDeformationUniforms and TEffectNode(Node).InternalDeformationOnlyUniforms then
+  begin
+    if ProfileSharedEffects then Inc(SharedDeformationSkips);
+    { Numerical deformation inputs are bypassed by cached mode 2, but samplers
+      remain active in the linked program. Preserve their unit assignment in
+      declaration order: removing one could alias a sampler of another type,
+      even when that branch is not executed. Do not advance the value serial. }
+    if UseSharedEffectBindings then
+      ApplySharedEffectCached(TEffectNode(Node), True)
+    else
+      for I := 0 to Node.InterfaceDeclarations.Count - 1 do
+      begin
+        Field := Node.InterfaceDeclarations[I].Field;
+        if not ((Field is TSFNode) or (Field is TMFNode)) then Continue;
+        if Uniform(Field.X3DName, umIgnore).Location < 0 then Continue;
+        if SharedUniformsTextures.IndexOf(Field) < 0 then
+          SharedUniformsTextures.Add(Field);
+      end;
+    Exit;
+  end;
   if ProfileSharedEffects then begin Started:=Timer; Inc(SharedEffectCalls) end;
   try
   if UseSharedEffectBindings then begin
     ApplySharedEffectCached(TEffectNode(Node));
     Exit;
   end;
+  { Diagnostic fallback may be toggled between draws. It bypasses layout
+    ownership tracking, so the next cached draw must revalidate its values. }
+  for I:=0 to SharedEffectLayouts.Count-1 do
+    TSharedEffectBindings(SharedEffectLayouts.Objects[I]).LastValuesSerial:=-1;
   ConfigureShaderNameList(SharedUniformValues);
   for I := 0 to Node.InterfaceDeclarations.Count - 1 do
   begin
@@ -1451,11 +1494,12 @@ begin
   end;
 end;
 
-procedure TX3DShaderProgram.ApplySharedEffects(const Nodes: TMFNode);
+procedure TX3DShaderProgram.ApplySharedEffects(const Nodes: TMFNode;
+  const SkipDeformationUniforms: Boolean);
 var I: Integer;
 begin
   if Nodes <> nil then
-    for I := 0 to Nodes.Count - 1 do ApplySharedEffect(Nodes[I]);
+    for I := 0 to Nodes.Count - 1 do ApplySharedEffect(Nodes[I], SkipDeformationUniforms);
 end;
 
 { TDynamicUniformSingle ------------------------------------------------------ }
@@ -3200,23 +3244,24 @@ begin
   Result := ShadowDeclare[ShadowSampling = ssVarianceShadowMaps];
 end;
 
-procedure TShader.SetDynamicUniforms(AProgram: TX3DShaderProgram);
+procedure TShader.SetDynamicUniforms(AProgram: TX3DShaderProgram;
+  const SkipDeformationUniforms: Boolean);
 var
   I: Integer;
   Started, PartStarted: TTimerResult;
 begin
   if ProfileSharedEffects then Started:=Timer;
   AProgram.SharedUniformsTextures.Clear;
-  AProgram.ApplySharedEffects(AppearanceEffects);
+  AProgram.ApplySharedEffects(AppearanceEffects, SkipDeformationUniforms);
   if GroupEffects <> nil then
-    for I := 0 to GroupEffects.Count - 1 do AProgram.ApplySharedEffect(GroupEffects[I]);
+    for I := 0 to GroupEffects.Count - 1 do AProgram.ApplySharedEffect(GroupEffects[I], SkipDeformationUniforms);
   for I := 0 to TextureShaders.Count - 1 do
     if TextureShaders[I] is TTextureShader then
-      AProgram.ApplySharedEffects(TTextureShader(TextureShaders[I]).Node.FdEffects);
+      AProgram.ApplySharedEffects(TTextureShader(TextureShaders[I]).Node.FdEffects, SkipDeformationUniforms);
   if ProfileSharedEffects then PartStarted := Timer;
   for I := 0 to LightShaders.Count - 1 do
   begin
-    AProgram.ApplySharedEffects(LightShaders[I].Node.FdEffects);
+    AProgram.ApplySharedEffects(LightShaders[I].Node.FdEffects, SkipDeformationUniforms);
     LightShaders[I].SetDynamicUniforms(AProgram);
   end;
   if ProfileSharedEffects then begin

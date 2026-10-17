@@ -53,6 +53,11 @@
       Query immediately after rendering; buffers remain owned by the shape. }
     function DeformedQueryBuffers(out Coordinates, Indices: TGLBuffer;
       out Stride, VertexCount, IndexCount: Cardinal; out Posed: Boolean): Boolean;
+    { Identity of the final index data, including context/reallocation changes.
+      Query together with DeformedQueryBuffers, never use a borrowed GL name
+      or the triangle count as topology identity. }
+    function DeformedQueryTopology: QWord;
+    function DeformedQueryGeometry: QWord;
     { Prepare only static indexed geometry in the native cache, without
       textures, shaders or drawing. Call on the GL thread on a query miss. }
     function PrepareSurfaceQueryBuffers(const RenderOptions: TCastleRenderOptions): Boolean;
@@ -126,6 +131,16 @@ begin
   if Posed then begin Coordinates:=Cache.PoseVbo[Cache.PoseRead];Stride:=10*SizeOf(Single);end;
   if Cache.Arrays.HasIndexes then begin Indices:=Cache.Vbo[vtIndex];IndexCount:=Cache.Arrays.IndexesCount;end
   else IndexCount:=VertexCount;
+end;
+
+function TX3DRendererShape.DeformedQueryTopology: QWord;
+begin
+  if Cache <> nil then Result := Cache.DeformedTopologyId else Result := 0;
+end;
+
+function TX3DRendererShape.DeformedQueryGeometry: QWord;
+begin
+  if Cache <> nil then Result := Cache.DeformedGeometryId else Result := 0;
 end;
 
 function TX3DRendererShape.PrepareSurfaceQueryBuffers(

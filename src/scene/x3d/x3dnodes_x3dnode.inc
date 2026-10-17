@@ -68,6 +68,13 @@
   TFindNodeOption = (fnNilOnMissing, fnOnlyActive);
   TFindNodeOptions = set of TFindNodeOption;
 
+  { Internal observers of authored data, including direct Field.Changed calls.
+    Unlike exposed X3D events these are also sent for non-exposed fields. }
+  TNodeFieldChangeNotification = procedure(const Node: TX3DNode;
+    const Field: TX3DField) of object;
+  TNodeFieldChangeNotificationList = {$ifdef FPC}specialize{$endif}
+    TMethodList<TNodeFieldChangeNotification>;
+
   { X3D node. Every X3D node class descends from this. }
   TX3DNode = class(TX3DFileItem)
   strict private
@@ -98,6 +105,8 @@
     FCDataField: TMFString;
     FDestructionNotifications: TNodeDestructionNotificationList;
     FCallingDestructionNotifications: Boolean;
+    FFieldChangeNotifications: TNodeFieldChangeNotificationList;
+    FFieldChangeNotificationLevel: Cardinal;
     FScene: TX3DEventsEngine;
     FInternalSceneShape: TObject;
 
@@ -1151,6 +1160,15 @@
       @groupBegin }
     procedure AddDestructionNotification(const Event: TNodeDestructionNotification);
     procedure RemoveDestructionNotification(const Event: TNodeDestructionNotification);
+
+    { Scoped cache dependencies. Observers may invalidate their own cache, but
+      must not change/free this node during dispatch. Removing an observer is
+      immediate and safe, including removal/destruction of another observer.
+      Additions are called starting with the next notification. The list is
+      allocated only for nodes that actually have observers. @exclude }
+    procedure InternalAddFieldChangeNotification(const Event: TNodeFieldChangeNotification);
+    procedure InternalRemoveFieldChangeNotification(const Event: TNodeFieldChangeNotification);
+    procedure InternalFieldChanged(const AField: TX3DField);
     { @groupEnd }
 
     { Scene that will be notified about changes to this node.
@@ -1398,6 +1416,8 @@ begin
     FreeAndNil(FDestructionNotifications);
   end;
 
+  FreeAndNil(FFieldChangeNotifications);
+
   if FVRML1Children <> nil then
     VRML1ChildrenClear;
 
@@ -1475,6 +1495,54 @@ begin
     Exit;
   if FDestructionNotifications <> nil then
     FDestructionNotifications.Remove(Event);
+end;
+
+procedure TX3DNode.InternalAddFieldChangeNotification(const Event: TNodeFieldChangeNotification);
+begin
+  if not Assigned(Event) then Exit;
+  if FCallingDestructionNotifications then
+    raise Exception.Create('Cannot observe fields of a node being destroyed');
+  if FFieldChangeNotifications = nil then
+    FFieldChangeNotifications := TNodeFieldChangeNotificationList.Create;
+  FFieldChangeNotifications.Add(Event);
+end;
+
+procedure TX3DNode.InternalRemoveFieldChangeNotification(const Event: TNodeFieldChangeNotification);
+var
+  I: Integer;
+begin
+  if FFieldChangeNotifications = nil then Exit;
+  I := FFieldChangeNotifications.IndexOf(Event);
+  if I < 0 then Exit;
+  if FFieldChangeNotificationLevel <> 0 then
+    { Do not shift the live iteration. A removed observer must not be invoked
+      later in this dispatch, even if its owner has already been freed. }
+    FFieldChangeNotifications[I] := nil
+  else
+    FFieldChangeNotifications.Delete(I);
+end;
+
+procedure TX3DNode.InternalFieldChanged(const AField: TX3DField);
+var
+  I, Last: Integer;
+  Callback: TNodeFieldChangeNotification;
+begin
+  if FFieldChangeNotifications = nil then Exit;
+  Last := FFieldChangeNotifications.Count - 1;
+  Inc(FFieldChangeNotificationLevel);
+  try
+    for I := 0 to Last do
+    begin
+      Callback := FFieldChangeNotifications[I];
+      if Assigned(Callback) then Callback(Self, AField);
+    end;
+  finally
+    Dec(FFieldChangeNotificationLevel);
+    if FFieldChangeNotificationLevel = 0 then
+      for I := FFieldChangeNotifications.Count - 1 downto 0 do
+        if not Assigned(FFieldChangeNotifications[I]) then
+          FFieldChangeNotifications.Delete(I);
+  end;
 end;
 
 function TX3DNode.Unused: Boolean;

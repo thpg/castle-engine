@@ -154,6 +154,12 @@
       camera/pass and may be captured once for all passes of a frame.
       Runtime-only; do not set for effects with other vertex side effects. }
     InternalCacheVertexAnimation: Boolean;
+    { Explicit runtime-only contract: every custom uniform in this effect is
+      consumed exclusively by the object-space deformation plug. A draw that
+      reuses a valid captured pose may omit numerical values (sampler bindings
+      remain assigned to preserve their linked-program texture units). Do not
+      mark effects that also feed fragment/material/eye-space calculations. }
+    InternalDeformationOnlyUniforms: Boolean;
     { Optional immutable source/interface fingerprint, assigned before prepare.
       Equal keys share a program, but receive this instance's fields per draw.
       Empty preserves the standard event-bound private-program behaviour. }

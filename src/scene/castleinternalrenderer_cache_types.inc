@@ -117,10 +117,21 @@
     { Small CPU hierarchy over unchanged indexed triangle ranges, only
       present on static geometry explicitly marked by its producer. }
     IndexRangeCulling: TStaticMeshIndexRanges;
+    SpatialJob: TSpatialMeshJob;
+    SpatialStream: TSpatialMeshIndexStream;
+    SpatialVbo, SpatialIndirectVbo: TGLBuffer;
+    SpatialUploaded: SizeUInt;
+    SpatialUploadFrame: Int64;
 
     { Geometry-only preparation for surface queries. The first normal draw
       replaces the minimal layout through the existing arrays/VBO path. }
     SurfaceQueryOnly: Boolean;
+
+    { Monotonic identity of the final GPU index topology. Unlike a GL name
+      or object pointer this cannot alias a destroyed/recreated cache. Pose,
+      origin and coordinate-only animation do not invalidate the indices. }
+    DeformedTopologyId: QWord;
+    DeformedGeometryId: QWord;
 
     { What VBOs do we need to reload at next LoadArraysToVbo call.
       This also implies that content for this VBOs needs to be created,
@@ -143,6 +154,8 @@
     PoseRead: Integer;
     PoseValid, PosePending: Boolean;
     procedure ClearPose;
+    procedure ClearSpatial;
+    function PrepareSpatial: Boolean;
 
     { Like TX3DRendererShape.LoadArraysToVbo,
       but takes explicit DynamicGeometry. }
@@ -182,9 +195,33 @@
 
 { TShapeCache ---------------------------------------------------------------- }
 
+var
+  LastDeformedTopologyId: QWord = 0;
+
+function NextDeformedTopologyId: QWord;
+begin
+  Inc(LastDeformedTopologyId);
+  Result := LastDeformedTopologyId;
+end;
+
+function SpatialIndexBuffersSupported: Boolean; inline;
+begin
+  {$ifdef OpenGLES}
+  Result := False;
+  {$else}
+  { Upload uses COPY_WRITE_BUFFER to avoid disturbing VAO / CGE bindings.
+    VBO and multidraw alone are insufficient on desktop GL 2.x / 3.0. }
+  Result := (GLFeatures <> nil) and GLFeatures.VertexBufferObject and
+    (GLFeatures.Version_3_1 or GL_ARB_copy_buffer) and
+    Assigned(glMultiDrawElements);
+  {$endif}
+end;
+
 constructor TShapeCache.Create;
 begin
   inherited;
+  DeformedTopologyId := NextDeformedTopologyId;
+  DeformedGeometryId := NextDeformedTopologyId;
   VboToReload := AllVboTypes;
 end;
 
@@ -200,7 +237,10 @@ procedure TShapeCache.GLContextClose;
 var
   I: TVboType;
 begin
+  DeformedTopologyId := NextDeformedTopologyId;
+  DeformedGeometryId := NextDeformedTopologyId;
   FreeAndNil(IndexRangeCulling);
+  ClearSpatial;
   ClearPose;
   if Vbo[vtCoordinate] <> GLObjectNone then
   begin
@@ -228,10 +268,54 @@ end;
 
 procedure TShapeCache.InvalidateVertexData(const Changed: TVboTypes);
 begin
+  ClearSpatial;
   FreeAndNil(IndexRangeCulling);
   { The old pose cannot be replayed after geometry or weights change. }
   PoseValid := false;
   VboToReload := VboToReload + Changed;
+end;
+
+procedure TShapeCache.ClearSpatial;
+begin
+  if SpatialJob<>nil then begin SpatialJob.Cancel;SpatialJob.Release;SpatialJob:=nil end;
+  FreeAndNil(SpatialStream);
+  FreeBuffer(SpatialVbo);FreeBuffer(SpatialIndirectVbo);
+  SpatialUploaded:=0;SpatialUploadFrame:=-1;
+end;
+function TShapeCache.PrepareSpatial:Boolean;
+{$ifndef OpenGLES}
+var Bytes,Amount:SizeUInt;OldBuffer:GLint;
+{$endif}
+begin
+  Result:=False;
+  {$ifndef OpenGLES}
+  if not UseSpatialIndexStreams or not SpatialRenderAllowed or
+     not SpatialIndexBuffersSupported then Exit;
+  if (SpatialJob<>nil) and SpatialJob.Ready then begin
+    SpatialStream:=SpatialJob.TakeResult;SpatialJob.Release;SpatialJob:=nil;
+  end;
+  if SpatialStream=nil then Exit;
+  Bytes:=SizeUInt(SpatialStream.IndexCount)*SizeOf(TGeometryIndex);
+  if Bytes=0 then Exit;
+  if SpatialUploaded<Bytes then begin
+    if SpatialUploadFrame=TFramesPerSecond.RenderFrameId then Exit;
+    SpatialUploadFrame:=TFramesPerSecond.RenderFrameId;
+    Amount:=SpatialUploadAllowance(SpatialUploadFrame,Bytes-SpatialUploaded);
+    if Amount=0 then Exit;
+    glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING,@OldBuffer);
+    try
+      if SpatialVbo=0 then begin
+        glGenBuffers(1,@SpatialVbo);glBindBuffer(GL_COPY_WRITE_BUFFER,SpatialVbo);
+        glBufferData(GL_COPY_WRITE_BUFFER,Bytes,nil,GL_STATIC_DRAW);
+      end else glBindBuffer(GL_COPY_WRITE_BUFFER,SpatialVbo);
+      glBufferSubData(GL_COPY_WRITE_BUFFER,SpatialUploaded,Amount,
+        Pointer(PtrUInt(SpatialStream.IndexData)+SpatialUploaded));
+      Inc(SpatialUploaded,Amount);Inc(SpatialUploadBytes,Amount);
+      if SpatialUploaded=Bytes then SpatialStream.ReleaseUploadedIndices;
+    finally glBindBuffer(GL_COPY_WRITE_BUFFER,OldBuffer) end;
+  end;
+  Result:=SpatialUploaded=Bytes;
+  {$endif}
 end;
 
 procedure TShapeCache.LoadArraysToVbo(const DynamicGeometry: boolean);
@@ -282,6 +366,10 @@ var
          as it tries to access non-existent data from vertex arrays). }
        (VboAllocatedSize[VboType] <> Size) then
     begin
+      if VboType = vtIndex then
+        DeformedTopologyId := NextDeformedTopologyId;
+      if VboType = vtCoordinate then
+        DeformedGeometryId := NextDeformedTopologyId;
       RenderContext.BindBuffer[Target] := Vbo[VboType];
       TargetGL := BufferTargetGL[Target];
       if NewVbos or
@@ -327,6 +415,15 @@ begin
     not use gl_PrimitiveID (each separate draw restarts that counter).
     Bounds are also created while the A/B switch is off, so switching on
     never requires VBO regeneration or synchronous readback. }
+  ClearSpatial;
+  {$ifndef OpenGLES}
+  if UseSpatialIndexStreams and SpatialRenderAllowed and SpatialIndexBuffersSupported and
+     not DynamicGeometry and (Geometry<>nil) and
+     Geometry.MetadataBoolean['castle.spatialIndexStream'] and
+     (Arrays<>nil) and not Arrays.DataFreed and (Arrays.Indexes<>nil) and
+     (Arrays.Indexes.Count>=4096*3) then
+    SpatialJob:=QueueSpatialMesh(Arrays,Geometry.MetadataDouble['castle.staticIndexRangePadding']);
+  {$endif}
   FreeAndNil(IndexRangeCulling);
   { The individual-draw fallback was slower in measurements. GLES and
     desktop drivers without multi-draw keep the original single draw and

@@ -175,7 +175,7 @@ uses Classes, SysUtils, Generics.Collections,
   CastleShapes, CastleClassUtils, CastleInternalCompositeImage,
   CastleInternalGeometryArrays, CastleInternalArraysGenerator, CastleRendererInternalShader,
   CastleRendererInternalTextureEnv, CastleBoxes, CastleTransform, CastleRenderOptions,
-  CastleInternalShadowMaps, CastleInternalMeshIndexRanges;
+  CastleInternalShadowMaps, CastleInternalMeshIndexRanges, CastleInternalSpatialIndexStream;
 
 {$define read_interface}
 
@@ -203,7 +203,7 @@ uses Math,
   X3DCameraUtils, CastleProjection, CastleRectangles, CastleTriangles,
   CastleCameras, CastleSceneInternalShape, CastleApplicationProperties,
   CastleRenderContext, CastleInternalGLUtils, CastleTimeUtils, CastleUriUtils,
-  CastleFrustum;
+  CastleFrustum, CastleInternalPoseCache;
 
 {$define read_implementation}
 

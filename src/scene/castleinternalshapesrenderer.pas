@@ -43,7 +43,11 @@ type
   TShapesCollector = class
   private
     FCollected: TCollectedShapeList;
+    FPool: TCollectedShapeList;
+    FPoolUsed: Integer;
+    FOwnsObjects: Boolean;
     FRenderEvents: TRenderEventList; //< may be nil, treat like empty
+    function Acquire: TCollectedShape;
   public
     { Optional borrowed filter; checked before allocating a collected entry. }
     ShapeFilter: TCollectedShapeFilter;
@@ -204,11 +208,15 @@ type
       read FOnCustomShapeSort write FOnCustomShapeSort;
   end;
 
+var
+  CollectorDiagnostics:Boolean=false;
+  CollectorAllocated,CollectorReused,CollectorClears:QWord;
+
 implementation
 
 uses SysUtils,
   {$ifdef OpenGLES} CastleGLES, {$else} CastleGL, {$endif}
-  CastleScene, CastleGLUtils, CastleRenderContext, CastleColors,
+  CastleScene, CastleGLUtils, CastleRenderContext, CastleColors, CastleImages,
   X3DCameraUtils, CastleTimeUtils;
 
 { TRenderEventList ---------------------------------------------------------- }
@@ -226,21 +234,43 @@ end;
 constructor TShapesCollector.Create(const OwnsObjects: Boolean);
 begin
   inherited Create;
-  FCollected := TCollectedShapeList.Create(OwnsObjects);
+  FOwnsObjects := OwnsObjects and (GetEnvironmentVariable('REZVIVO_LEGACY_COLLECTOR_ALLOC')<>'1');
+  FCollected := TCollectedShapeList.Create(OwnsObjects and not FOwnsObjects);
+  if FOwnsObjects then FPool := TCollectedShapeList.Create(true);
 end;
 
 destructor TShapesCollector.Destroy;
 begin
   FreeAndNil(FCollected);
+  FreeAndNil(FPool);
   FreeAndNil(FRenderEvents);
   inherited;
 end;
 
 procedure TShapesCollector.Clear;
 begin
+  if CollectorDiagnostics then Inc(CollectorClears);
   FCollected.Clear;
+  FPoolUsed := 0;
   if FRenderEvents <> nil then
     FRenderEvents.Clear;
+end;
+
+function TShapesCollector.Acquire: TCollectedShape;
+begin
+  { Only the owning collector holds reusable entries. Filtered views borrow
+    them and cannot recycle/free them; deferred blending allocates in its
+    own owner from the outset, so clearing the source cannot overwrite it. }
+  if not FOwnsObjects then begin
+    if CollectorDiagnostics then Inc(CollectorAllocated);
+    Exit(TCollectedShape.Create);
+  end;
+  if FPoolUsed = FPool.Count then begin
+    FPool.Add(TCollectedShape.Create);
+    if CollectorDiagnostics then Inc(CollectorAllocated);
+  end else if CollectorDiagnostics then Inc(CollectorReused);
+  Result := FPool[FPoolUsed];
+  Inc(FPoolUsed);
 end;
 
 procedure TShapesCollector.Add(const Shape: TGLShape;
@@ -252,9 +282,14 @@ procedure TShapesCollector.Add(const Shape: TGLShape;
   const ShadowCatcher: Boolean);
 var
   NewCollected: TCollectedShape;
+  Owner: TShapesCollector;
 begin
   if Assigned(ShapeFilter) and not ShapeFilter(Shape) then Exit;
-  NewCollected := TCollectedShape.Create;
+  Owner := Self;
+  if (DeferredBlending <> nil) and RenderOptions.Blending and
+     (RenderOptions.Mode <> rmSolidColor) and (Shape.AlphaChannel = acBlending) then
+    Owner := DeferredBlending;
+  NewCollected := Owner.Acquire;
   NewCollected.Shape := Shape;
   NewCollected.RenderOptions := RenderOptions;
   NewCollected.SceneTransform := SceneTransform;
@@ -262,12 +297,7 @@ begin
   NewCollected.DepthRange := DepthRange;
   NewCollected.ShadowVolumesReceiver := ShadowVolumesReceiver;
   NewCollected.ShadowCatcher := ShadowCatcher;
-  if (DeferredBlending <> nil) and NewCollected.UseBlending then
-  begin
-    Assert(DeferredBlending <> Self);
-    DeferredBlending.FCollected.Add(NewCollected);
-  end else
-    FCollected.Add(NewCollected);
+  Owner.FCollected.Add(NewCollected);
 end;
 
 procedure TShapesCollector.AddFiltered(const Source: TShapesCollector;
@@ -292,8 +322,7 @@ begin
     FRenderEvents.Clear;
     FRenderEvents.AddRange(Source.FRenderEvents);
   end else
-    FreeAndNil(FRenderEvents);
-  Assert((Source.FRenderEvents = nil) = (FRenderEvents = nil));
+    if FRenderEvents <> nil then FRenderEvents.Clear;
 end;
 
 procedure TShapesCollector.AddRenderEvent(const Transformation: TTransformation;
@@ -827,4 +856,6 @@ begin
     results after a sharp camera change; toggling requires no scene walk. }
 end;
 
+initialization
+  CollectorDiagnostics:=GetEnvironmentVariable('REZVIVO_RENDER_DIAGNOSTICS')='1';
 end.

@@ -197,6 +197,9 @@ type
       { OnlyActive } Boolean,
       { OnlyVisible } Boolean,
       { OnlyCollidable } Boolean ] of TShapesHash;
+    FixedLodChildrenList: array [Boolean, Boolean] of TShapeList;
+    FixedLodChildrenListRevision: array [Boolean, Boolean] of QWord;
+    FixedLodChildrenListValid: array [Boolean, Boolean] of Boolean;
     { Automatically set when adding item to TShapeTreeGroup. }
     FParent: TShapeTree;
     FDepth: Cardinal;
@@ -223,6 +226,8 @@ type
       const OnlyActive: boolean;
       const OnlyVisible: boolean;
       const OnlyCollidable: boolean); virtual;
+    procedure TraverseFixedLodCore(const Func: TShapeTraverseFunc;
+      const OnlyVisible, OnlyCollidable: Boolean);
 
     { Apply transformation change to this tree.
       This is called from @link(FastTransformUpdate).
@@ -281,6 +286,12 @@ type
       const OnlyActive: boolean;
       const OnlyVisible: boolean = false;
       const OnlyCollidable: boolean = false): TShapeList;
+    { Immutable-world snapshot selection: level zero of each LOD, while
+      Switch.whichChoice and visibility/collision restrictions remain active.
+      Does not alter the raster LOD level or use its cached active lists.
+      Owned by this tree; invalidated by InternalFixedLodSnapshotRevision. }
+    function TraverseFixedLodList(const OnlyVisible: Boolean = False;
+      const OnlyCollidable: Boolean = False): TShapeList;
 
     { How many shapes would be enumerated by @link(Traverse). }
     function ShapesCount(const OnlyActive: boolean;
@@ -1339,6 +1350,9 @@ begin
     for OnlyVisible := Low(Boolean) to High(Boolean) do
       for OnlyCollidable := Low(Boolean) to High(Boolean) do
         FreeAndNil(CachedChildrenList[OnlyActive, OnlyVisible, OnlyCollidable]);
+  for OnlyVisible := Low(Boolean) to High(Boolean) do
+    for OnlyCollidable := Low(Boolean) to High(Boolean) do
+      FreeAndNil(FixedLodChildrenList[OnlyVisible, OnlyCollidable]);
   inherited;
 end;
 
@@ -1482,8 +1496,21 @@ begin
 end;
 
 procedure TShapeTree.InvalidateMaxShapesCount;
+var
+  OnlyVisible, OnlyCollidable: Boolean;
 begin
   FMaxShapesCount := -1;
+  { Structural edits can precede the scene's geometry notification, and a
+    detached/batched tree has no scene revision at all. Never keep pointers
+    to removed TShape instances in the fixed-selection cache. Camera LOD
+    changes do not call this method. }
+  for OnlyVisible := Low(Boolean) to High(Boolean) do
+    for OnlyCollidable := Low(Boolean) to High(Boolean) do
+    begin
+      FixedLodChildrenListValid[OnlyVisible, OnlyCollidable] := False;
+      if FixedLodChildrenList[OnlyVisible, OnlyCollidable] <> nil then
+        FixedLodChildrenList[OnlyVisible, OnlyCollidable].Clear;
+    end;
   if FParent <> nil then
     FParent.InvalidateMaxShapesCount;
 end;
@@ -1522,6 +1549,52 @@ begin
   end else
   begin
     TraverseCoreToList;
+  end;
+end;
+
+procedure TShapeTree.TraverseFixedLodCore(const Func: TShapeTraverseFunc;
+  const OnlyVisible, OnlyCollidable: Boolean);
+var
+  Group: TShapeTreeGroup;
+  I, ChildIndexBegin, ChildIndexEnd: Integer;
+begin
+  if Self is TShapeTreeGroup then
+  begin
+    Group := TShapeTreeGroup(Self);
+    if OnlyVisible and (Group.BoundedFunctionality <> nil) and
+       not Group.BoundedFunctionality.Visible then Exit;
+    ChildIndexBegin := 0;
+    ChildIndexEnd := Group.Children.Count - 1;
+    { Only LOD selection is fixed. In particular, a Switch must still select
+      its current child instead of accidentally including inactive branches. }
+    Group.TraverseGroupLimitChildren(not (Group is TShapeTreeLOD),
+      OnlyVisible, OnlyCollidable, ChildIndexBegin, ChildIndexEnd);
+    if (Group is TShapeTreeLOD) and (ChildIndexEnd >= ChildIndexBegin) then
+      ChildIndexEnd := ChildIndexBegin;
+    for I := ChildIndexBegin to ChildIndexEnd do
+      Group.Children[I].TraverseFixedLodCore(Func, OnlyVisible, OnlyCollidable);
+  end else
+    TraverseCore(Func, True, OnlyVisible, OnlyCollidable);
+end;
+
+function TShapeTree.TraverseFixedLodList(const OnlyVisible, OnlyCollidable: Boolean): TShapeList;
+var
+  Revision: QWord;
+begin
+  if FParentScene <> nil then
+    Revision := TCastleSceneCore(FParentScene).InternalFixedLodSnapshotRevision
+  else Revision := 0;
+  Result := FixedLodChildrenList[OnlyVisible, OnlyCollidable];
+  if (Result = nil) or (FParentScene = nil) or
+     not FixedLodChildrenListValid[OnlyVisible, OnlyCollidable] or
+     (FixedLodChildrenListRevision[OnlyVisible, OnlyCollidable] <> Revision) then
+  begin
+    if Result = nil then Result := TShapeList.Create else Result.Clear;
+    FixedLodChildrenList[OnlyVisible, OnlyCollidable] := Result;
+    Result.AllocateAtLeast(MaxShapesCount);
+    TraverseFixedLodCore({$ifdef FPC}@{$endif} Result.AddConst, OnlyVisible, OnlyCollidable);
+    FixedLodChildrenListRevision[OnlyVisible, OnlyCollidable] := Revision;
+    FixedLodChildrenListValid[OnlyVisible, OnlyCollidable] := True;
   end;
 end;
 

@@ -87,6 +87,7 @@
     FExposed: boolean;
     FValueFromIsClause: boolean;
     FExposedEventsLinked: boolean;
+    FInternalSnapshotDependency: boolean;
     FResetValue: TX3DField;
 
     procedure SetExposed(Value: boolean);
@@ -224,6 +225,13 @@
     class function ExposedEventsFieldClass: TX3DFieldClass; virtual;
   public
     OnInputIgnore: TInputIgnoreEvent;
+
+    { Opt in for custom shader fields used by an immutable geometry/material
+      snapshot. A changed value invalidates the scene snapshot even if its
+      normal rendering notification is chNone. Runtime time/view/pass uniforms
+      must leave this false. Preserved by a field copy, not by AssignValue. }
+    property InternalSnapshotDependency: Boolean
+      read FInternalSnapshotDependency write FInternalSnapshotDependency;
 
     { Main constructor that initializes field when default value is not known.
 
@@ -741,6 +749,7 @@ begin
   if ParentNode <> nil then
   begin
     Parent := ParentNode as TX3DNode;
+    Parent.InternalFieldChanged(Self);
     if Parent is TEffectNode then
       TEffectNode(Parent).InternalSharedValuesChanged;
     if Parent.Scene <> nil then
@@ -981,6 +990,7 @@ begin
   FieldOrEventAssignCommon(Source);
 
   ValueFromIsClause := Source.ValueFromIsClause;
+  InternalSnapshotDependency := Source.InternalSnapshotDependency;
 
   Exposed := Source.Exposed;
   Assert(Exposed = (ExposedEvents[false] <> nil));

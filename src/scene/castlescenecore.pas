@@ -548,6 +548,7 @@ type
       by Shapes.Traverse.
       Never zero. }
     FShapesHash: TShapesHash;
+    FSnapshotIdentity, FSnapshotRevision, FFixedLodSnapshotRevision: QWord;
 
     FExposeTransforms: TStrings;
     FExposedTransforms: TExposedTransformList;
@@ -557,6 +558,10 @@ type
       TTimeDependentFunctionality.PartialSend before
       TTimeDependentFunctionality.SetTime. }
     procedure PartialSendBegin(const TimeFunctionality: TTimeDependentFunctionality);
+    { Only UpdateLods may use CameraLodSelectionOnly. A snapshot traversal
+      that always selects LOD level zero is unchanged by that camera choice. }
+    procedure GeometryChangedForSnapshot(const Changes: TGeometryChanges;
+      const LocalGeometryShape: TShape; const CameraLodSelectionOnly: Boolean);
 
     { Finalize what PartialSendBegin started,
       after TTimeDependentFunctionality.SetTime was called. }
@@ -2156,6 +2161,14 @@ type
     procedure InternalIncShapesHash;
     { @exclude }
     property InternalShapesHash: TShapesHash read FShapesHash;
+    { Stable identity is never a recycled object address. Snapshot revision
+      covers geometry, visibility and material changes, not render uniforms. }
+    property InternalSnapshotIdentity: QWord read FSnapshotIdentity;
+    property InternalSnapshotRevision: QWord read FSnapshotRevision;
+    { Revision for TShapeTree.TraverseFixedLodList only. Automatic camera LOD
+      selection does not change that list; real geometry, Switch, visibility,
+      transforms and material dependencies still invalidate it. }
+    property InternalFixedLodSnapshotRevision: QWord read FFixedLodSnapshotRevision;
 
     { Load again the model from current URL.
       This makes sense to be used when underlying file on disk
@@ -2496,6 +2509,7 @@ uses Math, DateUtils,
 { SceneLifecycleLog ------------------------------------------------------ }
 
 var
+  SnapshotIdentitySerial: Int64 = 0;
   SLLock: TRTLCriticalSection;
   SLFileName: String = '';
   SLSessionStarted: Boolean = false;
@@ -3188,6 +3202,9 @@ begin
   FRootNode := nil;
   FOwnsRootNode := true;
   FShapesHash := 1;
+  FSnapshotIdentity := QWord(InterlockedIncrement64(SnapshotIdentitySerial));
+  FSnapshotRevision := 1;
+  FFixedLodSnapshotRevision := 1;
 
   FShapeOctreeLimits := DefShapeOctreeLimits;
 
@@ -5241,6 +5258,15 @@ begin
   if LogChanges then
     DoLogChanges;
 
+  { Custom uniforms normally use chNone and do not invalidate immutable
+    snapshots. Explicit dependencies do. Structural effect changes (parts,
+    enabled, source) use regular changes and must invalidate like any node. }
+  if (Change <> chNone) or Field.InternalSnapshotDependency then
+  begin
+    Inc(FSnapshotRevision);
+    Inc(FFixedLodSnapshotRevision);
+  end;
+
   { Optimize Change = chNone case: no need even for Begin/EndChangesSchedule }
   if Change = chNone then
     Exit;
@@ -5293,13 +5319,57 @@ end;
 
 procedure TCastleSceneCore.InternalGeometryChanged(const Changes: TGeometryChanges;
   const LocalGeometryShape: TShape);
+begin
+  GeometryChangedForSnapshot(Changes, LocalGeometryShape, False);
+end;
+
+procedure TCastleSceneCore.GeometryChangedForSnapshot(const Changes: TGeometryChanges;
+  const LocalGeometryShape: TShape; const CameraLodSelectionOnly: Boolean);
 var
   MaybeBoundingBoxChanged: boolean;
 const
   { Whether LocalGeometryChanged was called, which means that octree and/or
     bounding box/sphere of some shape changed. }
   SomeLocalGeometryChanged = [gcAll, gcLocalGeometryChanged, gcLocalGeometryChangedCoord];
+
+  procedure LogSnapshotGeometryChange;
+  const
+    ChangeNames: array [TGeometryChange] of String = (
+      'gcAll', 'gcCollidableTransformChanged', 'gcVisibleTransformChanged',
+      'gcLocalGeometryChanged', 'gcLocalGeometryChangedCoord',
+      'gcActiveShapesChanged');
+  var
+    Change: TGeometryChange;
+    Reasons, ShapeDescription: String;
+  begin
+    Reasons := '';
+    for Change := Low(TGeometryChange) to High(TGeometryChange) do
+      if Change in Changes then
+      begin
+        if Reasons <> '' then Reasons := Reasons + ',';
+        Reasons := Reasons + ChangeNames[Change];
+      end;
+    ShapeDescription := 'nil';
+    if LocalGeometryShape <> nil then
+    begin
+      ShapeDescription := LocalGeometryShape.ClassName + ' at ' +
+        PointerToStr(LocalGeometryShape);
+      if LocalGeometryShape.Node <> nil then
+        ShapeDescription := ShapeDescription + Format(' node=%s (%s)',
+          [LocalGeometryShape.Node.X3DName, LocalGeometryShape.Node.X3DType]);
+    end;
+    WritelnLog('X3D change', Format(
+      'InternalGeometryChanged: scene=%s (%s) identity=%d revision=%d fixed_lod_revision=%d camera_lod_only=%d changes=[%s] shape=%s',
+      [Name, ClassName, FSnapshotIdentity, FSnapshotRevision,
+       FFixedLodSnapshotRevision, Ord(CameraLodSelectionOnly), Reasons,
+       ShapeDescription]));
+  end;
+
 begin
+  Inc(FSnapshotRevision);
+  if not CameraLodSelectionOnly then Inc(FFixedLodSnapshotRevision);
+  if LogChanges then
+    LogSnapshotGeometryChange;
   MaybeBoundingBoxChanged := not (
     { Box stayed the same if we changed shape geometry,
       but TShapeNode provides explicit bbox information,
@@ -8409,6 +8479,12 @@ procedure TCastleSceneCore.LocalRender(const Params: TRenderParams);
     begin
       if LODTree.UpdateLevel(LocalCameraPosition, ProcessEvents) then
       begin
+        if LogChanges then
+          WritelnLog('X3D change', Format(
+            'LOD active shapes: scene=%s identity=%d node=%s (%s) level=%d camera=(%f,%f,%f)',
+            [Name, FSnapshotIdentity, LODTree.Node.X3DName,
+             LODTree.Node.X3DType, LODTree.Level, LocalCameraPosition.X,
+             LocalCameraPosition.Y, LocalCameraPosition.Z]));
         { This means that active shapes changed, so we have to change things
           depending on them. Just like after Switch.whichChoice change. }
 
@@ -8419,7 +8495,7 @@ procedure TCastleSceneCore.LocalRender(const Params: TRenderParams);
           { Calculation traverses over active nodes (uses RootNode.Traverse). }
           fvMainLightForShadows];
 
-        InternalGeometryChanged([gcActiveShapesChanged], nil);
+        GeometryChangedForSnapshot([gcActiveShapesChanged], nil, True);
 
         InternalIncShapesHash; // TShapeTreeLOD returns now different things
       end;

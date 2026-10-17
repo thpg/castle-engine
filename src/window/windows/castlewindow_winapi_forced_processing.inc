@@ -161,17 +161,6 @@ procedure TForcedProcessingMessageState.BeforeDefWindowProc(
   const uMsg: UINT; const wParm: WPARAM; const lParm: LPARAM);
 begin
   State.Fps.UpdateFps;
-
-  if (State.Necessary <> 0) and
-     (State.Disallowed = 0) and
-     (not State.Window.Closed) and
-     State.Fps.CheckLimit then
-  begin
-    State.Fps.CallBegin;
-    Application.UpdateAndRenderEverything;
-    State.Fps.CallEnd;
-  end;
-
   MakeNecessary := uMsg = WM_NCLBUTTONDOWN;
 
   { Disallow in certain cases, even when Necessary<>0. Prevents:
@@ -187,6 +176,20 @@ begin
     (uMsg = WM_IME_SETCONTEXT) or
     // we recreate the window as windowed?
     (uMsg = WM_ACTIVATE);
+
+  if (State.Necessary <> 0) and
+     (State.Disallowed = 0) and (not MakeDisallowed) and
+     (Application.FUpdateAndRenderDepth = 0) and
+     (not State.Window.Closed) and
+     State.Fps.CheckLimit then
+  begin
+    State.Fps.CallBegin;
+    try
+      Application.UpdateAndRenderEverything;
+    finally
+      State.Fps.CallEnd;
+    end;
+  end;
 
   if MakeNecessary then Inc(State.Necessary);
   if MakeDisallowed then Inc(State.Disallowed);

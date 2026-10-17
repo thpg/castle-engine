@@ -2069,6 +2069,11 @@ type
     Current: TCastleWindow;
     LastLimitFPSTime: TTimerResult;
     FMainWindow: TCastleWindow;
+    { Native modal move/resize loops may dispatch messages from a thread
+      wait or a driver call. They must not start another frame inside the
+      current update/render. Explicit ProcessMessage loops used by CGE
+      modal dialogs still work; only unsolicited native frames are blocked. }
+    FUpdateAndRenderDepth: Cardinal;
     //FUserAgent: String;
     { Send this to DoDropFiles when next window is open.
       Should always be nil or non-nil with non-zero count.
@@ -4327,68 +4332,91 @@ var
   Window: TCastleWindow;
 begin
   WasAnyRendering := false;
-
-  { We call ApplicationProperties._Update *right before rendering*, because:
-
-     - This makes ApplicationProperties.OnUpdate callbacks have similar frequency
-       as calls to window's OnRender callbacks, when the application
-       is under a lot of stress (many messages).
-
-       Otherwise, if we would move this call outside of
-       "if .. not CheckMessage then ..." in castlewindow_winsystem.inc,
-       then doing something
-       that generates a lot of events (like moving the mouse)
-       would make us generate a lot OnUpdate events,
-       without many OnRender between. Which isn't actually prohibited...
-       but it seems useless.
-
-     - Calling OnUpdate later, only if "not WasAnyRendering", would
-       also be bad, because then intensive redrawing (e.g. if you redraw
-       every frame, with AutoRedisplay) would make OnUpdate called less
-       often.
-
-     In effect, we like to have OnUpdate called roughly as often as OnRender,
-     even if we don't really guarantee it. }
-  ApplicationProperties._Update;
-  if Terminated then Exit;
-
-  { Redraw some windows, and call window's OnUpdate.
-
-    Gathering OnUpdate and OnRender of the same window together,
-    we minimize the amount of needed MakeContextCurrent calls in case
-    of applications with multiple windows.
-
-    Remember that every callback may close the window, which also modifies
-    the OpenWindows and OpenWindowsCount. The code below secures from
-    all such changes, e.g. by copying "OpenWindows[I]" at the beginning,
-    and checking "Window.Closed" all the time. }
-  I := 0;
-  while I < OpenWindowsCount do
-  begin
-    Window := OpenWindows[I];
-    Window.DoUpdate;
-    if Window.Closed then Continue {don't Inc(I)};
-    if Terminated then Exit;
-    Inc(I);
-  end;
-
-  ApplicationProperties._UpdateEnd;
-  if Terminated then Exit;
-
-  I := 0;
-  while I < OpenWindowsCount do
-  begin
-    Window := OpenWindows[I];
-    if Window.Invalidated then
+  Inc(FUpdateAndRenderDepth);
+  try
+    {$ifdef CASTLE_WINDOW_WINAPI}
+    { Keep size/layout and render targets constant throughout a frame.
+      WM_SIZE only records the newest dimensions, including when a worker
+      wait pumps messages in the middle of model preparation. }
+    I := 0;
+    while I < OpenWindowsCount do
     begin
-      WasAnyRendering := true;
-      Window.DoRender;
+      Window := OpenWindows[I];
+      if Window.FWinApiResizePending then
+      begin
+        Window.FWinApiResizePending := false;
+        Window.DoResize(Window.FRealWidth, Window.FRealHeight, false);
+        if Window.Closed then Continue;
+        if Terminated then Exit;
+      end;
+      Inc(I);
+    end;
+    {$endif}
+
+    { We call ApplicationProperties._Update *right before rendering*, because:
+
+       - This makes ApplicationProperties.OnUpdate callbacks have similar frequency
+         as calls to window's OnRender callbacks, when the application
+         is under a lot of stress (many messages).
+
+         Otherwise, if we would move this call outside of
+         "if .. not CheckMessage then ..." in castlewindow_winsystem.inc,
+         then doing something
+         that generates a lot of events (like moving the mouse)
+         would make us generate a lot OnUpdate events,
+         without many OnRender between. Which isn't actually prohibited...
+         but it seems useless.
+
+       - Calling OnUpdate later, only if "not WasAnyRendering", would
+         also be bad, because then intensive redrawing (e.g. if you redraw
+         every frame, with AutoRedisplay) would make OnUpdate called less
+         often.
+
+       In effect, we like to have OnUpdate called roughly as often as OnRender,
+       even if we don't really guarantee it. }
+    ApplicationProperties._Update;
+    if Terminated then Exit;
+
+    { Redraw some windows, and call window's OnUpdate.
+
+      Gathering OnUpdate and OnRender of the same window together,
+      we minimize the amount of needed MakeContextCurrent calls in case
+      of applications with multiple windows.
+
+      Remember that every callback may close the window, which also modifies
+      the OpenWindows and OpenWindowsCount. The code below secures from
+      all such changes, e.g. by copying "OpenWindows[I]" at the beginning,
+      and checking "Window.Closed" all the time. }
+    I := 0;
+    while I < OpenWindowsCount do
+    begin
+      Window := OpenWindows[I];
+      Window.DoUpdate;
       if Window.Closed then Continue {don't Inc(I)};
       if Terminated then Exit;
-    end else
-      Window.Container.Fps.InternalSleeping;
+      Inc(I);
+    end;
 
-    Inc(I);
+    ApplicationProperties._UpdateEnd;
+    if Terminated then Exit;
+
+    I := 0;
+    while I < OpenWindowsCount do
+    begin
+      Window := OpenWindows[I];
+      if Window.Invalidated then
+      begin
+        WasAnyRendering := true;
+        Window.DoRender;
+        if Window.Closed then Continue {don't Inc(I)};
+        if Terminated then Exit;
+      end else
+        Window.Container.Fps.InternalSleeping;
+
+      Inc(I);
+    end;
+  finally
+    Dec(FUpdateAndRenderDepth);
   end;
 end;
 

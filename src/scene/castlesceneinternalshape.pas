@@ -51,6 +51,8 @@ type
     OcclusionQueryId: TGLQuery;
     OcclusionQueryAsked: boolean;
     OcclusionQueryAskedFrameId: TFrameId;
+    OcclusionQueryViewIdentity: QWord;
+    OcclusionQueryPass: Integer;
 
     { Do not share the cache of this shape with other shapes.
       Offers tiny optimization when you know that this shape cannot be shared anyway.
@@ -102,6 +104,11 @@ type
       TCastleScene.ShadowCatcher. }
     ShadowCatcher: Boolean;
 
+    { Scratch valid only between PrepareSortKeys and this list's Sort. Each
+      pass refreshes it; it never relies on a previous camera/transform. }
+    SortDistance: Single;
+    SortEmpty: Boolean;
+
     { Should rendering this use blending (to account for partial transparency). }
     function UseBlending: Boolean;
   end;
@@ -109,6 +116,7 @@ type
   TCollectedShapeList = class({$ifdef FPC}specialize{$endif} TObjectList<TCollectedShape>)
   strict private
     Camera: TViewVectors;
+    procedure PrepareSortKeys(const ShapeSort: TShapeSortNoAuto);
 
     function CompareBackToFront2D(
       {$ifdef GENERICS_CONSTREF}constref{$else}const{$endif} ShapeA, ShapeB: TCollectedShape): Integer;
@@ -149,6 +157,12 @@ type
       const ACamera: TViewVectors;
       const ShapeSort: TShapeSortNoAuto);
   end;
+
+var
+  UsePreparedShapeSort: Boolean = true;
+  ShapeSortDiagnostics: Boolean = false;
+  ShapeSortKeyCount: QWord;
+  ShapeSortPrepareSeconds: Double;
 
 implementation
 
@@ -358,6 +372,45 @@ end;
 type
   TCollectedShapeComparer = {$ifdef FPC}specialize{$endif} TComparer<TCollectedShape>;
 
+procedure TCollectedShapeList.PrepareSortKeys(const ShapeSort: TShapeSortNoAuto);
+var
+  Item: TCollectedShape;
+  Box: TBox3D;
+  Point: TVector3;
+  Started: TTimerResult;
+begin
+  if not UsePreparedShapeSort or (ShapeSort in [sortNone, sortCustom]) then Exit;
+  if ShapeSortDiagnostics then Started := Timer;
+  for Item in Self do
+  begin
+    Item.SortEmpty := false;
+    case ShapeSort of
+      sort2D, sort3D, sort3DVerticalBillboards:
+        begin
+          Box := Item.Shape.BoundingBox;
+          Item.SortEmpty := Box.IsEmpty;
+          if Item.SortEmpty then begin Item.SortDistance := 0; Continue; end;
+          if ShapeSort = sort2D then
+            Item.SortDistance := Item.SceneTransform.MultPoint(Box.Data[0]).Z
+          else
+            Item.SortDistance := TVector3.DotProduct(
+              Item.SceneTransform.MultPoint(Box.Center), Camera.Direction);
+        end;
+      sort3DOrigin, sort3DGround:
+        begin
+          Point := (Item.SceneTransform * Item.Shape.OriginalState.Transformation.Transform).MultPoint(TVector3.Zero);
+          if ShapeSort = sort3DGround then Point.Y := 0;
+          Item.SortDistance := TVector3.DotProduct(Point, Camera.Direction);
+        end;
+    end;
+  end;
+  if ShapeSortDiagnostics then
+  begin
+    Inc(ShapeSortKeyCount, Count);
+    ShapeSortPrepareSeconds := ShapeSortPrepareSeconds + Started.ElapsedTime;
+  end;
+end;
+
 function TCollectedShapeList.CompareBackToFront2D(
   {$ifdef GENERICS_CONSTREF}constref{$else}const{$endif} ShapeA, ShapeB: TCollectedShape): Integer;
 var
@@ -378,6 +431,12 @@ var
   end;
 
 begin
+  if UsePreparedShapeSort then
+  begin
+    if (not ShapeA.SortEmpty) and (ShapeB.SortEmpty or (ShapeA.SortDistance < ShapeB.SortDistance)) then Exit(-1);
+    if (not ShapeB.SortEmpty) and (ShapeA.SortEmpty or (ShapeB.SortDistance < ShapeA.SortDistance)) then Exit(1);
+    Exit(0);
+  end;
   A := ShapeA.Shape.BoundingBox;
   B := ShapeB.Shape.BoundingBox;
 
@@ -427,6 +486,12 @@ var
   end;
 
 begin
+  if UsePreparedShapeSort then
+  begin
+    if (not ShapeA.SortEmpty) and (ShapeB.SortEmpty or (ShapeA.SortDistance > ShapeB.SortDistance)) then Exit(-1);
+    if (not ShapeB.SortEmpty) and (ShapeA.SortEmpty or (ShapeB.SortDistance > ShapeA.SortDistance)) then Exit(1);
+    Exit(0);
+  end;
   { We always treat empty box as closer than non-empty.
     And two empty boxes are always equal.
 
@@ -468,6 +533,7 @@ function TCollectedShapeList.CompareBackToFront3DOrigin(
 var
   PointA, PointB: TVector3;
 begin
+  if UsePreparedShapeSort then Exit(Sign(B.SortDistance - A.SortDistance));
   PointA := (A.SceneTransform * A.Shape.OriginalState.Transformation.Transform).MultPoint(TVector3.Zero);
   PointB := (B.SceneTransform * B.Shape.OriginalState.Transformation.Transform).MultPoint(TVector3.Zero);
   Result := Sign(
@@ -480,6 +546,7 @@ function TCollectedShapeList.CompareBackToFront3DGround(
 var
   PointA, PointB: TVector3;
 begin
+  if UsePreparedShapeSort then Exit(Sign(B.SortDistance - A.SortDistance));
   { TODO: what's more efficient - MultTransform 2x, or multiply matrix + MultTransform? }
   PointA := (A.SceneTransform * A.Shape.OriginalState.Transformation.Transform).MultPoint(TVector3.Zero);
   PointB := (B.SceneTransform * B.Shape.OriginalState.Transformation.Transform).MultPoint(TVector3.Zero);
@@ -510,6 +577,8 @@ begin
     but project camera direction on Y=0 plane. }
   if ShapeSort = sort3DVerticalBillboards then
     Camera.Direction.Y := 0;
+
+  PrepareSortKeys(ShapeSort);
 
   case ShapeSort of
     sort2D      : Sort(TCollectedShapeComparer.Construct({$ifdef FPC}@{$endif} CompareBackToFront2D));
@@ -568,6 +637,8 @@ begin
   if ShapeSort = sort3DVerticalBillboards then
     Camera.Direction.Y := 0;
 
+  PrepareSortKeys(ShapeSort);
+
   case ShapeSort of
     sort2D      : Sort(TCollectedShapeComparer.Construct({$ifdef FPC}@{$endif} CompareFrontToBack2D));
     sort3DVerticalBillboards,
@@ -584,4 +655,7 @@ begin
   end;
 end;
 
+initialization
+  UsePreparedShapeSort := GetEnvironmentVariable('REZVIVO_LEGACY_SHAPE_SORT') <> '1';
+  ShapeSortDiagnostics := GetEnvironmentVariable('REZVIVO_RENDER_DIAGNOSTICS') = '1';
 end.

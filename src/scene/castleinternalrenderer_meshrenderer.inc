@@ -92,7 +92,10 @@ type
   private
     { Available inside RenderCoordinate* }
     Arrays: TGeometryArrays;
+    DeformationUniformsSkipped: Boolean;
+    UniformTextureBase: Cardinal;
     function PerVertexColor: Boolean;
+    function CachedPoseDecision(const ProgramObject: TX3DShaderProgram): TPoseCacheDecision;
   protected
     { Override these to render contents of Arrays.
       These are all called only when Coord is assigned.
@@ -182,6 +185,37 @@ begin
 end;
 
 { TBaseCoordinateRenderer ------------------------------------------------ }
+
+function TBaseCoordinateRenderer.CachedPoseDecision(
+  const ProgramObject: TX3DShaderProgram): TPoseCacheDecision;
+var
+  Input: TPoseCacheInput;
+  {$ifndef OpenGLES}C: TShapeCache;{$endif}
+begin
+  Input := Default(TPoseCacheInput);
+  {$ifndef OpenGLES}
+  C := Shape.Cache;
+  if (C <> nil) and (ProgramObject <> nil) then
+  begin
+    Input.Frame := TFramesPerSecond.FrameId;
+    Input.Revision := RenderOptions.CachedAnimationRevision;
+    Input.CacheEnabled := UseCachedRiderMeshes;
+    Input.ProgramSupportsCache := ProgramObject.CachedDeformation;
+    Input.HasSourceBuffer := Vbo[vtCoordinate] <> GLObjectNone;
+    Input.UniqueOwner := C.References = 1;
+    Input.Requested := RequireDeformedMeshBuffers or (Input.Revision <> 0) or
+      (Renderer.RenderingCamera.Target = rtShadowMap) or (C.PoseFrame = Input.Frame);
+    Input.PoseValid := C.PoseValid;
+    Input.PoseBuffersReady := (C.PoseVbo[0] <> GLObjectNone) and
+      (C.PoseVbo[1] <> GLObjectNone);
+    Input.ExpectedBytes := QWord(Arrays.Count) * (10 * SizeOf(Single));
+    Input.PoseBytes := C.PoseSize;
+    Input.PoseFrame := C.PoseFrame;
+    Input.PoseRevision := C.PoseRevision;
+  end;
+  {$endif}
+  Result := DecidePoseCache(Input);
+end;
 
 procedure TBaseCoordinateRenderer.Render;
 var
@@ -404,25 +438,29 @@ var
     C: TShapeCache;
     P: TX3DShaderProgram;
     Frame: QWord;
-    Revision: QWord;
-    RevisionDriven, CaptureNeeded, ReturningAfterGap: Boolean;
+    Decision: TPoseCacheDecision;
     WriteIndex: Integer;
   {$endif}
   begin
     {$ifndef OpenGLES}
-    C := Shape.Cache;
-    if C = nil then Exit;
-    { Generated shadow textures run during Update, before Render begins. }
-    Frame := TFramesPerSecond.FrameId;
-    Revision := RenderOptions.CachedAnimationRevision;
-    RevisionDriven := Revision <> 0;
     if not (CurrentMeshShader is TX3DShaderProgram) then Exit;
     P := TX3DShaderProgram(CurrentMeshShader);
+    Decision := CachedPoseDecision(P);
+    { Re-evaluate immediately before use. If an intervening resource operation
+      invalidated reuse, restore all omitted inputs before TF/direct rendering.
+      Do not retain cache/program pointers across the uniform preparation. }
+    if DeformationUniformsSkipped and not Decision.SkipDeformationUniforms then
+    begin
+      Shader.SetDynamicUniforms(P, False);
+      BoundTextureUnits := UniformTextureBase;
+      P.SetupUniforms(BoundTextureUnits);
+      DeformationUniformsSkipped := False;
+    end;
     if P.CachedDeformation then P.SetUniform('castle_DeformationMode', 0);
-    if not (UseCachedRiderMeshes and P.CachedDeformation and
-      (Vbo[vtCoordinate] <> GLObjectNone) and (C.References = 1) and
-      (RequireDeformedMeshBuffers or RevisionDriven or (Renderer.RenderingCamera.Target = rtShadowMap) or
-        (C.PoseFrame = Frame))) then
+    C := Shape.Cache;
+    if C = nil then Exit;
+    Frame := Decision.Frame;
+    if not Decision.Enabled then
     begin
       if C.PoseSize <> 0 then C.ClearPose;
       Exit;
@@ -432,9 +470,7 @@ var
       Preserve both VBOs across missed frames and refresh before reusing them.
       Revision-driven meshes also refresh once on return: an offscreen pose
       must not be displayed for one frame even when delayed capture is enabled. }
-    ReturningAfterGap := C.PoseValid and (C.PoseFrame <> Frame) and
-      (C.PoseFrame + 1 <> Frame);
-    if (not C.PoseValid) or (C.PoseSize <> Arrays.Count * PoseStride) then
+    if Decision.Allocate then
     begin
       C.ClearPose;
       C.PoseSize := Arrays.Count * PoseStride;
@@ -449,10 +485,6 @@ var
       end;
     end;
 
-    if RevisionDriven then
-      CaptureNeeded := ReturningAfterGap or (not C.PoseValid) or (C.PoseRevision <> Revision)
-    else
-      CaptureNeeded := (not C.PoseValid) or (C.PoseFrame <> Frame);
     if C.PoseFrame <> Frame then
     begin
       C.PoseFrame := Frame;
@@ -462,9 +494,9 @@ var
         C.PosePending := false;
       end;
     end;
-    if CaptureNeeded then
+    if Decision.Capture then
     begin
-      C.PoseRevision := Revision;
+      C.PoseRevision := Decision.Revision;
       WriteIndex := 1 - C.PoseRead;
       P.SetUniform('castle_DeformationMode', 1);
       glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, C.PoseVbo[WriteIndex]);
@@ -478,7 +510,7 @@ var
         glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
       end;
       Inc(CachedMeshCaptures);
-      if C.PoseValid and UseDelayedRiderMeshes and not ReturningAfterGap then
+      if C.PoseValid and UseDelayedRiderMeshes and not Decision.ReturningAfterGap then
         { Same-context GPU commands order feedback writes before vertex
           fetch. Do not poll a fence here: it would skip pose updates when
           the CPU submits frames ahead of the GPU. }
@@ -520,6 +552,9 @@ var
   TexCoordAttrib: TGLSLAttribute;
   ProfileStarted: TTimerResult;
   RangeCulling: TStaticMeshIndexRanges;
+  Spatial: TSpatialMeshIndexStream;
+  SpatialDraw:Boolean;
+  {$ifndef OpenGLES}OldIndirect:GLint;{$endif}
   DrawRange: TMeshIndexRange;
   RangeFrustum: TFrustum;
   MeshDrawCalls: Cardinal;
@@ -531,6 +566,7 @@ begin
   Attribs := nil;
   EnabledCount := 0;
   EnabledMask := 0;
+  DeformationUniformsSkipped := False;
 
   if ProfileSharedEffects then ProfileStarted := Timer;
   RenderCoordinateBegin;
@@ -732,6 +768,40 @@ begin
           {$ifndef OpenGLES}
           MultiRangeDraw := (Vbo[vtIndex] <> GLObjectNone) and
             Assigned(glMultiDrawElements);
+          {$endif}
+          SpatialDraw:=False;
+          {$ifndef OpenGLES}
+          if MultiRangeDraw and (Arrays.Primitive=gpTriangles) and Shape.Cache.PrepareSpatial then begin
+            Spatial:=Shape.Cache.SpatialStream;
+            if Spatial.IndexCount=Arrays.IndexesCount then begin
+              RangeFrustum.Init(RenderContext.ProjectionMatrix,ShapeModelView);
+              SpatialDraw:=Spatial.Select(RangeFrustum,128);
+            end;
+          end;
+          if SpatialDraw then begin
+            RenderContext.BindBuffer[btElementArray]:=Shape.Cache.SpatialVbo;
+            try
+              if Spatial.RangeCount>0 then begin
+                if UseSpatialIndirect and Assigned(glMultiDrawElementsIndirect) and
+                   (GLVersion.AtLeast(4, 3) or GL_ARB_multi_draw_indirect) then begin
+                  glGetIntegerv(GL_DRAW_INDIRECT_BUFFER_BINDING,@OldIndirect);
+                  try
+                    if Shape.Cache.SpatialIndirectVbo=0 then glGenBuffers(1,@Shape.Cache.SpatialIndirectVbo);
+                    glBindBuffer(GL_DRAW_INDIRECT_BUFFER,Shape.Cache.SpatialIndirectVbo);
+                    { Orphan before writing: previous queued passes retain their
+                      immutable command store; no fence wait or CPU readback. }
+                    glBufferData(GL_DRAW_INDIRECT_BUFFER,Spatial.RangeCount*SizeOf(TSpatialDrawCommand),
+                      Spatial.DrawCommands,GL_STREAM_DRAW);
+                    glMultiDrawElementsIndirect(Mode,GLIndexConst,nil,Spatial.RangeCount,SizeOf(TSpatialDrawCommand));
+                  finally glBindBuffer(GL_DRAW_INDIRECT_BUFFER,OldIndirect) end;
+                end else
+                  glMultiDrawElements(Mode,PGLsizei(Spatial.DrawCounts),GLIndexConst,Spatial.DrawOffsets,Spatial.RangeCount);
+                MeshDrawCalls:=1;
+              end;
+              Inc(SpatialPasses);Inc(SpatialDraws,MeshDrawCalls);
+              Inc(SpatialCandidateIndices,Arrays.IndexesCount);Inc(SpatialSubmittedIndices,Spatial.SelectedIndexCount);
+            finally RenderContext.BindBuffer[btElementArray]:=Vbo[vtIndex] end;
+          end else
           {$endif}
           if UseStaticIndexRangeCulling and MultiRangeDraw and
              (RangeCulling <> nil) and
@@ -1397,7 +1467,10 @@ begin
       if ProfileSharedEffects then
         MeshShaderSeconds := MeshShaderSeconds + TimerSeconds(Timer, ProfileStarted);
       if CurrentX3DProgram <> nil then // may be nil on desktops
-        Shader.SetDynamicUniforms(CurrentX3DProgram);
+      begin
+        DeformationUniformsSkipped := CachedPoseDecision(CurrentX3DProgram).SkipDeformationUniforms;
+        Shader.SetDynamicUniforms(CurrentX3DProgram, DeformationUniformsSkipped);
+      end;
     end else
       CurrentMeshShader := nil;
   end;
@@ -1406,7 +1479,10 @@ begin
   RenderContext.CurrentProgram := CurrentMeshShader; // enable the CurrentMeshShader for OpenGL
 
   if CurrentMeshShader <> nil then
+  begin
+    UniformTextureBase := BoundTextureUnits;
     CurrentMeshShader.SetupUniforms(BoundTextureUnits);
+  end;
   if ProfileSharedEffects then
     MeshTextureSeconds := MeshTextureSeconds + TimerSeconds(Timer, ProfileStarted);
 end;

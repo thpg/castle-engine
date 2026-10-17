@@ -57,6 +57,8 @@ type
     FPreviousPosition, FPreviousDirection, FPreviousUp: TVector3;
     FPreviousProjection: TMatrix4;
     FVisibleFrame: Int64;
+    FViewIdentity: QWord;
+    FPreviousViewport:TVector4;
   public
     constructor Create;
     destructor Destroy; override;
@@ -67,11 +69,20 @@ type
       const RenderShape: TShapeRenderEvent);
   end;
 
+{ Internal A/B switch. Pending queries always keep their owner until resolved. }
+var
+  UseNonBlockingOcclusion: Boolean = true;
+  OcclusionDiagnostics: Boolean = false;
+  OcclusionPending, OcclusionAged, OcclusionFallback, OcclusionReads: QWord;
+  OcclusionReadSeconds: Double;
+
 implementation
 
 uses SysUtils,
   CastleClassUtils, CastleInternalShapeOctree, CastleInternalGLUtils,
   CastleUtils, CastleTimeUtils, CastleLog;
+
+var NextOcclusionViewIdentity: QWord = 0;
 
 { TOcclusionCullingUtilsRenderer ------------------------------------------------- }
 
@@ -184,6 +195,8 @@ const
 constructor TOcclusionCullingRenderer.Create;
 begin
   inherited Create;
+  Inc(NextOcclusionViewIdentity);
+  FViewIdentity := NextOcclusionViewIdentity;
   FUtils := TOcclusionCullingUtilsRenderer.Create;
 end;
 
@@ -196,19 +209,28 @@ end;
 procedure TOcclusionCullingRenderer.BeginView(const Params: TRenderParams);
 var
   Pos, Dir, Up, Delta: TVector3;
+  ViewportKey:TVector4;
 begin
   Pos := Params.RenderingCamera.View.Translation;
   Dir := Params.RenderingCamera.View.Direction;
   Up := Params.RenderingCamera.View.Up;
   Delta := Pos - FPreviousPosition;
+  with RenderContext.Viewport do ViewportKey:=Vector4(Left,Bottom,Width,Height);
   { A query describes the preceding camera. On teleport, sharp turn or
     projection change render conservatively for one frame and refresh queries.
     Keep this state per viewport; shadow passes must not change it. }
   if (not FViewValid) or (Delta.Length > 1.0) or
      (TVector3.DotProduct(Dir, FPreviousDirection) < 0.9961947) or
      (TVector3.DotProduct(Up, FPreviousUp) < 0.9961947) or
-     (not CompareMem(@FPreviousProjection, @Utils.ProjectionMatrix, SizeOf(TMatrix4))) then
+     (not CompareMem(@FPreviousProjection, @Utils.ProjectionMatrix, SizeOf(TMatrix4))) or
+     (not CompareMem(@FPreviousViewport,@ViewportKey,SizeOf(ViewportKey))) then
+  begin
     FVisibleFrame := TFramesPerSecond.RenderFrameId;
+    { Pending results may arrive several frames after this invalidation.
+      A one-frame force-visible flag alone cannot make those safe to use. }
+    Inc(NextOcclusionViewIdentity);FViewIdentity:=NextOcclusionViewIdentity;
+  end;
+  FPreviousViewport:=ViewportKey;
   FViewValid := True;
   FPreviousPosition := Pos;
   FPreviousDirection := Dir;
@@ -225,16 +247,24 @@ procedure TOcclusionCullingRenderer.Render(const CollectedShape: TCollectedShape
   function OcclusionQueryHit(const OcclusionQueryId: TGLQuery): Boolean;
   var
     SampleCount: TGLuint;
+    Started: TTimerResult;
   begin
+    if OcclusionDiagnostics then Started := Timer;
     {$ifdef CASTLE_WEBGL}
     SampleCount := glGetQueryParameter(OcclusionQueryId, GL_QUERY_RESULT);
     {$else}
     glGetQueryObjectuiv(OcclusionQueryId, GL_QUERY_RESULT, @SampleCount);
     {$endif}
     Result := SampleCount > 0;
+    if OcclusionDiagnostics then
+    begin
+      Inc(OcclusionReads);
+      OcclusionReadSeconds := OcclusionReadSeconds + Started.ElapsedTime;
+    end;
   end;
 
   function OcclusionQueryResultAvailable(const OcclusionQueryId: TGLQuery): Boolean;
+  var Available: TGLuint;
   begin
     {$ifdef CASTLE_WEBGL}
     { Is the occlusion query result available.
@@ -254,9 +284,10 @@ procedure TOcclusionCullingRenderer.Render(const CollectedShape: TCollectedShape
     }
     Result := glGetQueryParameter(OcclusionQueryId, GL_QUERY_RESULT_AVAILABLE);
     {$else}
-    { On non-web (OpenGL, OpenGLES), behave as if GL_QUERY_RESULT_AVAILABLE is true,
-      because we ask using GL_QUERY_RESULT which waits for result. }
-    Result := true;
+    if not UseNonBlockingOcclusion then Exit(true);
+    Available := GL_FALSE;
+    glGetQueryObjectuiv(OcclusionQueryId, GL_QUERY_RESULT_AVAILABLE, @Available);
+    Result := Available <> GL_FALSE;
     {$endif}
   end;
 
@@ -294,13 +325,19 @@ begin
   begin
     QueryResultAvailable := OcclusionQueryResultAvailable(Shape.OcclusionQueryId);
     if not QueryResultAvailable then
-      WasVisible := true // assume is visible
-    else
+    begin
+      WasVisible := true;
+      if OcclusionDiagnostics then Inc(OcclusionPending);
+    end else
     begin
       QueryResultAge := TFramesPerSecond.RenderFrameId - Shape.OcclusionQueryAskedFrameId;
-      if QueryResultAge > MaxOcclusionQueryResultAge then
-        WasVisible := true // assume is visible, query result is too old to trust it
-      else
+      if (QueryResultAge > MaxOcclusionQueryResultAge) or
+         (Shape.OcclusionQueryViewIdentity <> FViewIdentity) or
+         (Shape.OcclusionQueryPass <> Params.InternalPass) then
+      begin
+        WasVisible := true;
+        if OcclusionDiagnostics then Inc(OcclusionAged);
+      end else
         WasVisible := OcclusionQueryHit(Shape.OcclusionQueryId);
     end;
   end else
@@ -310,7 +347,10 @@ begin
   end;
 
   if (FVisibleFrame = TFramesPerSecond.RenderFrameId) or SceneMultipleInstances then
+  begin
     WasVisible := True;
+    if OcclusionDiagnostics then Inc(OcclusionFallback);
+  end;
 
   { Render shape, or shape box, possibly making new occlusion query. }
   OcclusionQueryAsk :=
@@ -352,6 +392,8 @@ begin
     glEndQuery(QueryTarget);
 
     Shape.OcclusionQueryAskedFrameId := TFramesPerSecond.RenderFrameId;
+    Shape.OcclusionQueryViewIdentity := FViewIdentity;
+    Shape.OcclusionQueryPass := Params.InternalPass;
   end else
   begin
     if WasVisible then
@@ -359,4 +401,7 @@ begin
   end;
 end;
 
+initialization
+  OcclusionDiagnostics := GetEnvironmentVariable('REZVIVO_RENDER_DIAGNOSTICS') = '1';
+  UseNonBlockingOcclusion := GetEnvironmentVariable('REZVIVO_LEGACY_OCCLUSION_WAIT') <> '1';
 end.

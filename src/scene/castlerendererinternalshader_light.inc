@@ -21,7 +21,24 @@
 //type
   TLightingModel = (lmPhong, lmPhysical, lmUnlit);
 
+  { Values, not pointer-only identity: fields can be changed directly in the
+    editor and a light allocation may reuse an address. The effective matrix
+    includes camera/pass and scene transforms; context lifetime is the program. }
+  TPreparedLightKey = packed record
+    Kind: Byte;
+    Position: TVector4;
+    Direction, Color, Attenuation: TVector3;
+    Intensity, AmbientIntensity, Radius: Single;
+    CosCutoff, BeamWidth, Exponent, Cutoff: Single;
+    HasRadius, HasAttenuation: Boolean;
+    ToEye: TMatrix4;
+  end;
+
   TLightUniforms = class
+    class var PreparedHits, PreparedMisses: QWord;
+    var
+    PreparedKey: TPreparedLightKey;
+    PreparedValid, PreparedEnabled, PreparedDiagnostics: Boolean;
     Number: Cardinal;
     ShaderProgram: TGLSLProgram;
 
@@ -48,6 +65,7 @@
     Attenuation: TVector3;
     AmbientColor, Color: TVector3;
 
+    constructor Create;
     procedure SetUniform(const NamePattern: String;
       var CurrentValue: Single; const NewValue: Single); overload;
     procedure SetUniform(const NamePattern: String;
@@ -106,6 +124,13 @@
 {$ifdef read_implementation}
 
 { TLightUniforms ------------------------------------------------------- }
+
+constructor TLightUniforms.Create;
+begin
+  inherited;
+  PreparedEnabled := GetEnvironmentVariable('REZVIVO_LEGACY_LIGHT_BINDINGS') <> '1';
+  PreparedDiagnostics := GetEnvironmentVariable('REZVIVO_RENDER_DIAGNOSTICS') = '1';
+end;
 
 procedure TLightUniforms.SetUniform(const NamePattern: String;
   var CurrentValue: Single; const NewValue: Single);
@@ -269,6 +294,7 @@ var
   LiSpot1: TSpotLightNode_1;
   LiSpot: TSpotLightNode;
   LightToEyeSpace: PMatrix4;
+  Key: TPreparedLightKey;
 begin
   if Node is TEnvironmentLightNode then
   begin
@@ -283,6 +309,52 @@ begin
     AProgram.FLightUniformsList.Add(Uniforms);
   end;
   Uniforms := AProgram.FLightUniformsList[Number];
+  if Uniforms.PreparedEnabled then
+  begin
+    FillChar(Key, SizeOf(Key), 0);
+    Key.Color := Node.FdColor.Value;
+    Key.Intensity := Node.FdIntensity.Value;
+    Key.AmbientIntensity := Node.FdAmbientIntensity.Value;
+    if Node is TAbstractPunctualLightNode then
+    begin
+      Key.Kind := 1;
+      Key.Position := Light^.Position;
+      if Light^.WorldCoordinates then Key.ToEye := RenderingCamera.Matrix
+      else Key.ToEye := Shader.SceneModelView;
+      if Node is TAbstractPositionalLightNode then
+      begin
+        Key.Kind := 2;
+        LiPos := TAbstractPositionalLightNode(Node);
+        Key.HasRadius := LiPos.HasRadius;
+        if Key.HasRadius then Key.Radius := Light^.Radius;
+        Key.HasAttenuation := LiPos.HasAttenuation;
+        if Key.HasAttenuation then Key.Attenuation := LiPos.FdAttenuation.Value;
+        if LiPos is TSpotLightNode_1 then
+        begin
+          Key.Kind := 3; LiSpot1 := TSpotLightNode_1(Node);
+          Key.CosCutoff := LiSpot1.SpotCosCutoff;
+          Key.Direction := Light^.Direction;
+          Key.Exponent := LiSpot1.SpotExponent;
+        end else
+        if LiPos is TSpotLightNode then
+        begin
+          Key.Kind := 4; LiSpot := TSpotLightNode(Node);
+          Key.CosCutoff := LiSpot.SpotCosCutoff;
+          Key.Direction := Light^.Direction;
+          Key.BeamWidth := LiSpot.FdBeamWidth.Value;
+          Key.Cutoff := LiSpot.FdCutOffAngle.Value;
+        end;
+      end;
+    end;
+    if Uniforms.PreparedValid and CompareMem(@Key, @Uniforms.PreparedKey, SizeOf(Key)) then
+    begin
+      if Uniforms.PreparedDiagnostics then Inc(TLightUniforms.PreparedHits);
+      Exit;
+    end;
+    Uniforms.PreparedKey := Key;
+    Uniforms.PreparedValid := true;
+    if Uniforms.PreparedDiagnostics then Inc(TLightUniforms.PreparedMisses);
+  end;
 
   { calculate Color3 = light color * light intensity }
   Color3 := Node.FdColor.Value * Node.FdIntensity.Value;

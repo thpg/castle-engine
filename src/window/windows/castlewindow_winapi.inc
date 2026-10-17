@@ -84,6 +84,7 @@ CastleInternalWindowModes, CastleMessages, CastleGameControllers, CastleUnicode,
 private
   h_Dc: HDC;
   h_Wnd: HWND;
+  FWinApiResizePending: Boolean;
 
   VK_LeftBracket_Exists,
   VK_RightBracket_Exists,
@@ -100,6 +101,7 @@ private
   VK_BackQuote,
   VK_BackSlash: Byte;
 
+  procedure QueueNativeResize(const AWidth, AHeight: Integer);
   function WindowProc(uMsg: UINT; wParm: WPARAM; lParm: LPARAM): LRESULT;
 
   { convert virtual key code (VK_xxx) to TKey. Returns keyNone if no conversion
@@ -370,9 +372,32 @@ begin
     Application.wndClassName). They don't set Get/SetWindowLongPtr,
     so Window here will be @nil in this case. }
   if Application.FindWindow(Window) >= 0 then
-    result := Window.WindowProc(uMsg, wParm, lParm)
+  begin
+    { Exceptions cannot unwind through user32's native callback boundary.
+      Deliver them to the same handler as the normal application loop, so
+      crash diagnostics and the application's error UI are not bypassed. }
+    try
+      Result := Window.WindowProc(uMsg, wParm, lParm);
+    except
+      Application.HandleException(Window);
+      Result := 0;
+    end;
+  end
   else
     result := DefWindowProcW(hWnd, uMsg, wParm, lParm);
+end;
+
+procedure TCastleWindow.QueueNativeResize(const AWidth, AHeight: Integer);
+begin
+  if not EventOpenCalled then
+    DoResize(AWidth, AHeight, false)
+  else
+  begin
+    FRealWidth := AWidth;
+    FRealHeight := AHeight;
+    FWinApiResizePending := true;
+    Invalidate;
+  end;
 end;
 
 function TCastleWindow.WindowProc(uMsg: UINT; wParm: WPARAM; lParm: LPARAM): LRESULT;
@@ -864,7 +889,7 @@ begin
         { Note: Window class has (VREDRAW or HREDRAW), so Windows will automatically
           take care of requesting window redraw after window resize. }
         if (wParm = SIZE_MAXIMIZED) or (wParm = SIZE_RESTORED) then
-          DoResize(TWinParam(lParm).LoWord, TWinParam(lParm).HiWord, false);
+          QueueNativeResize(TWinParam(lParm).LoWord, TWinParam(lParm).HiWord);
         (Container.PointerLock as TCastleWindowsPointerLock).UpdateClipCursor;
         Exit;
       end;
@@ -910,7 +935,7 @@ begin
           Do we really need to call DoResize, OnResize?
           Maybe we should just call only glViewport,
           using current RenderContext.Viewport? }
-        DoResize(fRealWidth, fRealHeight, false);
+        QueueNativeResize(fRealWidth, fRealHeight);
 
         (Container.PointerLock as TCastleWindowsPointerLock).UpdateClipCursor;
         Exit;
@@ -929,7 +954,7 @@ begin
       will just call WndProc) WM_ERASEBKGND, and we want to capture WM_ERASEBKGND. }
     WM_ERASEBKGND:
       begin
-        if IsWindowEnabled(H_Wnd) then
+        if IsWindowEnabled(H_Wnd) or (Application.FUpdateAndRenderDepth <> 0) then
           Invalidate else
           { If not IsWindowEnabled then we have a modal window blocking our window.
             Like a Windows.MessageBox. In this case, our Application.ProcessMessage
@@ -1258,6 +1283,7 @@ var
   H_Menu: HMenu;
   ClientRect: TRect;
 begin
+  FWinApiResizePending := false;
   { optionally hide mouse in FullScreem,
     set dwStyle and dwExStyle for our window }
   if FullScreen then
@@ -1458,6 +1484,7 @@ end;
 
 procedure TCastleWindow.CloseBackend;
 begin
+  FWinApiResizePending := false;
   ContextDestroy;
 
   if h_Dc <> 0 then
