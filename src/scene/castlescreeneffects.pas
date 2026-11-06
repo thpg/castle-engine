@@ -24,7 +24,7 @@ uses SysUtils, Classes,
   {$ifdef OpenGLES} CastleGLES, {$else} CastleGL, {$endif}
   CastleVectors, CastleGLShaders, CastleUIControls, X3DNodes, CastleGLImages,
   CastleRectangles, CastleScene, CastleTransform, CastleCameras, CastleGLUtils,
-  CastleRenderOptions, CastleInternalRenderer;
+  CastleRenderOptions, CastleInternalRenderer, CastleInternalScreenEffects;
 
 type
   { Screen effects are shaders that post-process the rendered screen.
@@ -93,18 +93,28 @@ type
       ScreenPoint: packed array [0..3] of TScreenPoint;
 
       FScreenEffectsEnable: Boolean;
+      FResolutionScale, CurrentResolutionScale: Single;
+      FResolutionSmoothing: Boolean;
+      ResolutionShader: TGLSLScreenEffect;
+      CurrentResolutionPass: Boolean;
+      SavedScissorSuspended: Boolean;
 
     function GetScreenEffectsCount: Cardinal;
     function GetScreenEffectsNeedDepth: Boolean;
     function GetScreenEffect(const Index: Integer): TGLSLProgram;
 
     procedure GLContextCloseEvent(Sender: TObject);
+    procedure SetResolutionScale(const Value: Single);
+    procedure FinishScreenEffects;
   protected
     { Valid only between Render and RenderOverChildren calls.
       Tells whether we actually use screen effects, thus RenderWithoutScreenEffects
       renders to texture.
       Read-only in descendants. }
     RenderScreenEffects: Boolean;
+
+    { Physical render target, independent of UI layout and input coordinates. }
+    function ScreenEffectsRenderRect: TRectangle;
 
     { Descendants with special rendering code should override this,
       and @italic(never) override @link(Render) or @link(RenderOverChildren)
@@ -207,6 +217,14 @@ type
 
     { Make the screen effects rendering resources ready (e.g. link shaders). }
     procedure PrepareResources;
+
+    { Scale the 3D/effect targets, then present to the original rectangle.
+      1 preserves the original rendering path. Values 0.25..1 are supported.
+      In reduced resolution, finish before drawing child UI so labels and
+      touch controls retain their native resolution and hit rectangles. }
+    property ResolutionScale: Single read FResolutionScale write SetResolutionScale;
+    property ResolutionSmoothing: Boolean read FResolutionSmoothing write FResolutionSmoothing;
+    function ResolutionRenderSize: TVector2Integer;
   end;
 
 implementation
@@ -214,7 +232,43 @@ implementation
 uses
   {$ifdef WASI} Job.Js, {$endif}
   CastleUtils, CastleLog, CastleRenderContext, CastleInternalGLUtils,
-  CastleApplicationProperties, CastleInternalScreenEffects;
+  CastleApplicationProperties, Math;
+
+const
+  { Spatial edge filtering of the finished low-resolution image. Inspired by
+    the directional luma test in NVIDIA's FXAA white paper:
+    https://developer.download.nvidia.com/assets/gamedev/files/sdk/11/FXAA_WhitePaper.pdf
+    No history, motion vectors, new geometry or UI filtering. }
+  ResolutionFragment =
+    'uniform bool resolution_smooth;'#10+
+    'vec4 resolve_sample(vec2 uv) {'#10+
+    '#ifdef MULTI_SAMPLING'#10+
+    ' vec2 p=uv*vec2(screen_width,screen_height)-0.5; ivec2 i=ivec2(floor(p)); vec2 f=fract(p);'#10+
+    ' ivec2 hi=ivec2(screen_width-1,screen_height-1);'#10+
+    ' return mix(mix(screen_get_color(clamp(i,ivec2(0),hi)),screen_get_color(clamp(i+ivec2(1,0),ivec2(0),hi)),f.x),'#10+
+    ' mix(screen_get_color(clamp(i+ivec2(0,1),ivec2(0),hi)),screen_get_color(clamp(i+ivec2(1,1),ivec2(0),hi)),f.x),f.y);'#10+
+    '#else'#10+
+    ' return texture2D(screen,uv);'#10+
+    '#endif'#10+
+    '}'#10+
+    'float resolve_luma(vec3 c){return dot(c,vec3(0.299,0.587,0.114));}'#10+
+    'void main(){'#10+
+    ' if(!resolution_smooth){gl_FragColor=screen_get_color(clamp(screen_position(),ivec2(0),ivec2(screen_width-1,screen_height-1)));return;}'#10+
+    ' vec2 uv=screenf_01_position,px=1.0/vec2(screen_width,screen_height);'#10+
+    ' vec4 center=resolve_sample(uv);float m=resolve_luma(center.rgb);'#10+
+    ' float a=resolve_luma(resolve_sample(uv+px*vec2(-1,-1)).rgb);'#10+
+    ' float b=resolve_luma(resolve_sample(uv+px*vec2(1,-1)).rgb);'#10+
+    ' float c=resolve_luma(resolve_sample(uv+px*vec2(-1,1)).rgb);'#10+
+    ' float d=resolve_luma(resolve_sample(uv+px*vec2(1,1)).rgb);'#10+
+    ' float lo=min(m,min(min(a,b),min(c,d))),hi=max(m,max(max(a,b),max(c,d)));'#10+
+    ' if(hi-lo<max(0.0312,hi*0.125)){gl_FragColor=center;return;}'#10+
+    ' vec2 dir=vec2(c+d-a-b,a+c-b-d);'#10+
+    ' float den=min(abs(dir.x),abs(dir.y))+max((a+b+c+d)*0.03125,0.0078125);'#10+
+    ' dir=clamp(dir/den,vec2(-8),vec2(8))*px;'#10+
+    ' vec3 inner=(resolve_sample(uv-dir/6.0).rgb+resolve_sample(uv+dir/6.0).rgb)*0.5;'#10+
+    ' vec3 outer=inner*0.5+(resolve_sample(uv-dir*0.5).rgb+resolve_sample(uv+dir*0.5).rgb)*0.25;'#10+
+    ' float l=resolve_luma(outer);gl_FragColor=vec4((l<lo||l>hi)?inner:outer,center.a);'#10+
+    '}';
 
 procedure SwapValues(var A, B: TGLTexture);
 var
@@ -232,6 +286,8 @@ begin
   inherited;
   FScreenEffectsTimeScale := 1;
   FScreenEffectsEnable := true;
+  FResolutionScale := 1;
+  CurrentResolutionScale := 1;
 
   FRenderer := TRenderer.Create(nil);
 
@@ -251,13 +307,38 @@ begin
 
   FreeAndNil(FPrepareParams);
   FreeAndNil(FRenderer);
+  FreeAndNil(ResolutionShader);
   inherited;
+end;
+
+procedure TCastleScreenEffects.SetResolutionScale(const Value: Single);
+begin
+  if (Value >= 0.25) and (Value <= 1) then FResolutionScale := Value
+  else FResolutionScale := 1;
+end;
+
+function TCastleScreenEffects.ScreenEffectsRenderRect: TRectangle;
+begin
+  Result := RenderRect.Round;
+  if RenderScreenEffects and CurrentResolutionPass then
+  begin
+    Result.Width := Max(1, Round(Result.Width * CurrentResolutionScale));
+    Result.Height := Max(1, Round(Result.Height * CurrentResolutionScale));
+  end;
+end;
+
+function TCastleScreenEffects.ResolutionRenderSize: TVector2Integer;
+begin
+  if RenderScreenEffects or CurrentResolutionPass then
+    Result := Vector2Integer(ScreenEffectTextureWidth, ScreenEffectTextureHeight)
+  else Result := Vector2Integer(RenderRect.Round.Width, RenderRect.Round.Height);
 end;
 
 procedure TCastleScreenEffects.GLContextCloseEvent(Sender: TObject);
 begin
   if ScreenEffectsScene <> nil then
     ScreenEffectsScene.GLContextClose;
+  FreeAndNil(ResolutionShader);
 end;
 
 procedure TCastleScreenEffects.AddScreenEffect(const Node: TAbstractChildNode);
@@ -350,6 +431,8 @@ function TCastleScreenEffects.GetScreenEffect(const Index: Integer): TGLSLProgra
 var
   SceneEffects: Integer;
 begin
+  if CurrentResolutionPass and (Index = CurrentScreenEffectsCount - 1) then
+    Exit(ResolutionShader);
   if ScreenEffectsScene <> nil then
     SceneEffects := ScreenEffectsScene.InternalScreenEffectsCount
   else
@@ -380,11 +463,19 @@ var
       CurrentScreenEffectsCount and later CurrentScreenEffectsNeedDepth
       values are constant, even if user modifies FScreenEffects in the middle. }
     CurrentScreenEffectsCount := GetScreenEffectsCount;
+    CurrentResolutionScale := FResolutionScale;
+    CurrentResolutionPass := CurrentResolutionScale < 1;
+    if CurrentResolutionPass then Inc(CurrentScreenEffectsCount);
     RenderScreenEffects := CurrentScreenEffectsCount <> 0;
     if not RenderScreenEffects then Exit; // no need to do anything else
 
     { all the checks below should pass on a modern GPU }
     SR := RenderRect.Round;
+    if CurrentResolutionPass then
+    begin
+      SR.Width := Max(1, Round(SR.Width * CurrentResolutionScale));
+      SR.Height := Max(1, Round(SR.Height * CurrentResolutionScale));
+    end;
     RenderScreenEffects :=
       (not GLFeatures.EnableFixedFunction) and
       GLFeatures.UseMultiTexturing and
@@ -392,6 +483,14 @@ var
         on old desktop OpenGL that does not support NPOT textures. }
       IsTextureSized(SR.Width, SR.Height, tsAny);
     if not RenderScreenEffects then Exit; // no need to do anything else
+
+    if CurrentResolutionPass and (ResolutionShader = nil) then
+    begin
+      ResolutionShader := TGLSLScreenEffect.Create;
+      ResolutionShader.ScreenEffectShader := ResolutionFragment;
+      try ResolutionShader.Link;
+      except FreeAndNil(ResolutionShader); raise end;
+    end;
 
     { check the need to render depth buffer to a texture. }
     CurrentScreenEffectsNeedDepth := GetScreenEffectsNeedDepth;
@@ -558,6 +657,11 @@ var
 
     ScreenEffectRTT.RenderBegin;
     ScreenEffectRTT.SetTexture(ScreenEffectTextureDest, ScreenEffectTextureTarget);
+    if CurrentResolutionPass then
+    begin
+      SavedScissorSuspended := RenderContext.ScissorSuspended;
+      RenderContext.ScissorSuspended := True;
+    end;
   end;
 
 begin
@@ -570,14 +674,35 @@ begin
   CheckScreenEffects;
   if RenderScreenEffects then
     BeginRenderingToTexture;
-  RenderWithoutScreenEffects;
+  try
+    RenderWithoutScreenEffects;
+  except
+    if RenderScreenEffects and CurrentResolutionPass then
+    begin
+      ScreenEffectRTT.RenderEnd;
+      RenderContext.ViewportDelta := TVector2Integer.Zero;
+      RenderContext.ScissorSuspended := SavedScissorSuspended;
+      RenderScreenEffects := False;
+    end;
+    raise;
+  end;
+  if RenderScreenEffects and CurrentResolutionPass then
+  begin
+    { Only the world and its effects use the reduced target. Finish before
+      the container traverses our child controls. }
+    try FinishScreenEffects;
+    finally
+      RenderContext.ScissorSuspended := SavedScissorSuspended;
+      RenderScreenEffects := False;
+    end;
+  end;
 end;
 
 procedure TCastleScreenEffects.RenderWithoutScreenEffects;
 begin
 end;
 
-procedure TCastleScreenEffects.RenderOverChildren;
+procedure TCastleScreenEffects.FinishScreenEffects;
 var
   SR: TRectangle;
 
@@ -614,6 +739,17 @@ var
 
       glActiveTexture(GL_TEXTURE0); // GLFeatures.UseMultiTexturing is already checked
       glBindTexture(ScreenEffectTextureTarget, ScreenEffectTextureSrc);
+      if (Shader = ResolutionShader) then
+      begin
+        Shader.Uniform('resolution_smooth').SetValue(FResolutionSmoothing);
+        if FResolutionSmoothing then
+        begin
+          {$ifndef OpenGLES}
+          if ScreenEffectTextureTarget <> GL_TEXTURE_2D_MULTISAMPLE then
+          {$endif}
+            SetTextureFilter(ScreenEffectTextureTarget, TextureFilter(minLinear, magLinear));
+        end;
+      end;
       BoundTextureUnits := 1;
 
       if CurrentScreenEffectsNeedDepth then
@@ -647,6 +783,15 @@ var
 
       glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
+      if (Shader = ResolutionShader) and FResolutionSmoothing then
+      begin
+        glActiveTexture(GL_TEXTURE0);
+        {$ifndef OpenGLES}
+        if ScreenEffectTextureTarget <> GL_TEXTURE_2D_MULTISAMPLE then
+        {$endif}
+          SetTextureFilter(ScreenEffectTextureTarget, TextureFilter(minNearest, magNearest));
+      end;
+
       AttribVertex.DisableArray;
       AttribTexCoord.DisableArray;
       RenderContext.BindBuffer[btArray] := GLObjectNone;
@@ -679,6 +824,8 @@ var
     end;
 
     { the last effect gets a texture, and renders straight into screen }
+    if CurrentResolutionPass then
+      RenderContext.ScissorSuspended := SavedScissorSuspended;
     RenderContext.ViewportDelta := TVector2Integer.Zero;
     RenderContext.Viewport := RenderRect.Round;
     RenderOneEffect(GetScreenEffect(CurrentScreenEffectsCount - 1));
@@ -686,7 +833,7 @@ var
 
   procedure EndRenderingToTexture;
   begin
-    SR := RenderRect.Round;
+    SR := Rectangle(0, 0, ScreenEffectTextureWidth, ScreenEffectTextureHeight);
 
     ScreenEffectRTT.RenderEnd;
 
@@ -697,9 +844,16 @@ var
   end;
 
 begin
+  { Normally the UI container prepares 2D state before RenderOverChildren.
+    Reduced resolution presents earlier, directly after the 3D pass. }
+  RenderContext.DepthTest := False;
+  EndRenderingToTexture;
+end;
+
+procedure TCastleScreenEffects.RenderOverChildren;
+begin
   inherited;
-  if RenderScreenEffects then
-    EndRenderingToTexture;
+  if RenderScreenEffects then FinishScreenEffects;
 end;
 
 procedure TCastleScreenEffects.Update(const SecondsPassed: Single; var HandleInput: boolean);
@@ -741,6 +895,7 @@ begin
   FreeAndNil(ScreenEffectRTT);
   FreeBuffer(ScreenPointVbo);
   FreeAndNil(ScreenPointVao);
+  FreeAndNil(ResolutionShader);
   inherited;
 end;
 

@@ -2380,7 +2380,7 @@ begin
   EnsureCameraDetected;
 
   Viewport := RenderRect.Round;
-  RenderContext.Viewport := Viewport;
+  RenderContext.Viewport := ScreenEffectsRenderRect;
 
   FProjection := CalculateProjection;
   {$ifdef FPC}

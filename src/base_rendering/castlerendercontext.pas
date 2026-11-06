@@ -111,6 +111,7 @@ type
       FLineWidth, FPointSize: Single;
       FGlobalAmbient: TCastleColorRGB;
       FGlobalScissor: TScissor;
+      FScissorSuspended: Boolean;
       FProjectionMatrix: TMatrix4;
       FDepthRange: TDepthRange;
       FCullFace, FFrontFaceCcw: boolean;
@@ -143,6 +144,7 @@ type
     procedure SetCullFace(const Value: boolean);
     procedure SetFrontFaceCcw(const Value: boolean);
     procedure SetDepthTest(const Value: Boolean);
+    procedure SetScissorSuspended(const Value: Boolean);
     procedure SetSampleAlphaToCoverage(const Value: Boolean);
     procedure SetDepthFunc(const Value: TDepthFunction);
     function GetColorMask: boolean;
@@ -208,6 +210,11 @@ type
       @groupBegin }
     procedure ScissorEnable(const Rect: TRectangle);
     procedure ScissorDisable;
+
+    { Temporarily suspend UI clipping while drawing to an independent render
+      target. Restore the previous value before presenting to the parent target.
+      Enabled TScissor objects remain intact, including nested scroll panels. }
+    property ScissorSuspended: Boolean read FScissorSuspended write SetScissorSuspended;
     { @groupEnd }
 
     { Current projection matrix.
@@ -732,6 +739,7 @@ end;
 function TRenderContext.FinalScissor(out Rect: TRectangle): Boolean;
 begin
   Result :=
+    (not FScissorSuspended) and
     (FEnabledScissors <> nil) and
     (FEnabledScissors.Count <> 0);
   if Result then
@@ -936,6 +944,16 @@ end;
 
 { TRenderContext.TScissorList ------------------------------------------------------------------- }
 
+procedure TRenderContext.SetScissorSuspended(const Value: Boolean);
+begin
+  if FScissorSuspended <> Value then
+  begin
+    TDrawableImage.BatchingFlush;
+    FScissorSuspended := Value;
+    FEnabledScissors.Update;
+  end;
+end;
+
 procedure TRenderContext.TScissorList.Update;
 var
   R: TRectangle;
@@ -944,7 +962,7 @@ begin
   // we need to flush batched things, before scissor change
   TDrawableImage.BatchingFlush;
 
-  if Count <> 0 then
+  if (Count <> 0) and (not RenderContext.ScissorSuspended) then
   begin
     R := Items[0].Rect;
     for I := 1 to Count - 1 do

@@ -477,7 +477,12 @@ begin
   ClearPreviousDownload;
 
 
-  if not UpdateInitialized then
+  { Download() owns and polls this instance synchronously in WaitForFinish.
+    It may run in a resource-loading worker, including through LoadImage or
+    LoadNode. Publishing it to OnUpdate would race the main-thread event list
+    on both Start and Destroy, and let the main thread access its reader.
+    Only genuinely asynchronous downloads need frame-driven updates. }
+  if (not ForceSynchronous) and (not UpdateInitialized) then
   begin
     ApplicationProperties.OnUpdate.Add({$ifdef FPC}@{$endif}Update);
     UpdateInitialized := true;
