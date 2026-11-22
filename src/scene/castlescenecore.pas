@@ -3202,7 +3202,12 @@ begin
   FRootNode := nil;
   FOwnsRootNode := true;
   FShapesHash := 1;
+  {$if defined(WASI) and not defined(FPC_WASM_THREADS)}
+  Inc(SnapshotIdentitySerial);
+  FSnapshotIdentity := QWord(SnapshotIdentitySerial);
+  {$else}
   FSnapshotIdentity := QWord(InterlockedIncrement64(SnapshotIdentitySerial));
+  {$endif}
   FSnapshotRevision := 1;
   FFixedLodSnapshotRevision := 1;
 

@@ -731,8 +731,13 @@ begin
 
   if not TVector2Integer.Equals(FViewportDelta, Value) then
   begin
+    TDrawableImage.BatchingFlush;
     FViewportDelta := Value;
     UpdateViewport;
+    { Scissors, like Viewport, are stored in logical window coordinates.
+      An embedded viewport rendered into a texture moves both to its origin. }
+    if (FEnabledScissors.Count <> 0) and (not FScissorSuspended) then
+      FEnabledScissors.Update;
   end;
 end;
 
@@ -968,7 +973,8 @@ begin
     for I := 1 to Count - 1 do
       R := R * Items[I].Rect;
     FFinalScissor := R;
-    glScissor(R.Left, R.Bottom, R.Width, R.Height);
+    glScissor(R.Left + RenderContext.ViewportDelta.X,
+      R.Bottom + RenderContext.ViewportDelta.Y, R.Width, R.Height);
     glEnable(GL_SCISSOR_TEST);
   end else
     glDisable(GL_SCISSOR_TEST);

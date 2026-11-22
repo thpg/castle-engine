@@ -657,11 +657,9 @@ var
 
     ScreenEffectRTT.RenderBegin;
     ScreenEffectRTT.SetTexture(ScreenEffectTextureDest, ScreenEffectTextureTarget);
+    SavedScissorSuspended := RenderContext.ScissorSuspended;
     if CurrentResolutionPass then
-    begin
-      SavedScissorSuspended := RenderContext.ScissorSuspended;
       RenderContext.ScissorSuspended := True;
-    end;
   end;
 
 begin
@@ -677,7 +675,7 @@ begin
   try
     RenderWithoutScreenEffects;
   except
-    if RenderScreenEffects and CurrentResolutionPass then
+    if RenderScreenEffects then
     begin
       ScreenEffectRTT.RenderEnd;
       RenderContext.ViewportDelta := TVector2Integer.Zero;
@@ -810,6 +808,9 @@ var
       (e.g. ControlRenderBegin done right before C.RenderOverChildren in CastleGLContainer).
       So set it as we need, again.
       And this time we don't need to deal with ViewportDelta, just zero it. }
+    { Fullscreen texture filters must cover the whole intermediate image.
+      Restore the parent's logical clipping only for the screen composite. }
+    RenderContext.ScissorSuspended := True;
     RenderContext.ViewportDelta := TVector2Integer.Zero;
     RenderContext.Viewport := Rectangle(0, 0, SR.Width, SR.Height);
 
@@ -824,8 +825,7 @@ var
     end;
 
     { the last effect gets a texture, and renders straight into screen }
-    if CurrentResolutionPass then
-      RenderContext.ScissorSuspended := SavedScissorSuspended;
+    RenderContext.ScissorSuspended := SavedScissorSuspended;
     RenderContext.ViewportDelta := TVector2Integer.Zero;
     RenderContext.Viewport := RenderRect.Round;
     RenderOneEffect(GetScreenEffect(CurrentScreenEffectsCount - 1));
@@ -853,7 +853,12 @@ end;
 procedure TCastleScreenEffects.RenderOverChildren;
 begin
   inherited;
-  if RenderScreenEffects then FinishScreenEffects;
+  if RenderScreenEffects then
+    try FinishScreenEffects;
+    finally
+      RenderContext.ScissorSuspended := SavedScissorSuspended;
+      RenderScreenEffects := False;
+    end;
 end;
 
 procedure TCastleScreenEffects.Update(const SecondsPassed: Single; var HandleInput: boolean);

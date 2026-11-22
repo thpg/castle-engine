@@ -1090,7 +1090,7 @@ var
   TempMat3f: TMatrix3List;
   TempMat4f: TMatrix4List;
 begin
-  if U.Location<0 then Exit;
+  if U.Location=GLUniformLocationNone then Exit;
 
   if UniformValue is TSFBool then
     U.SetValue(TSFBool(UniformValue).Value) else
@@ -1282,7 +1282,7 @@ begin
   begin
     IDecl := Node.InterfaceDeclarations[I];
     if ActiveUniformsOnly and
-       (Uniform(IDecl.FieldOrEvent.X3DName, umIgnore).Location < 0) then Continue;
+       (Uniform(IDecl.FieldOrEvent.X3DName, umIgnore).Location = GLUniformLocationNone) then Continue;
     if (IDecl.Field <> nil) and
        ((IDecl.Field is TSFNode) or
         (IDecl.Field is TMFNode)) then
@@ -1363,7 +1363,7 @@ begin
         Field:=Node.InterfaceDeclarations[I].Field;
         if Field=nil then Continue;
         U:=Uniform(Field.X3DName,umIgnore);
-        if U.Location<0 then Continue;
+        if U.Location=GLUniformLocationNone then Continue;
         Layout.Items[N].DeclarationIndex:=I;
         Layout.Items[N].Uniform:=U;
         if not((Field is TSFNode)or(Field is TMFNode))then begin
@@ -1443,7 +1443,7 @@ begin
       begin
         Field := Node.InterfaceDeclarations[I].Field;
         if not ((Field is TSFNode) or (Field is TMFNode)) then Continue;
-        if Uniform(Field.X3DName, umIgnore).Location < 0 then Continue;
+        if Uniform(Field.X3DName, umIgnore).Location = GLUniformLocationNone then Continue;
         if SharedUniformsTextures.IndexOf(Field) < 0 then
           SharedUniformsTextures.Add(Field);
       end;
@@ -1466,7 +1466,7 @@ begin
     Field := Node.InterfaceDeclarations[I].Field;
     if Field = nil then Continue;
     Key := Field.X3DName;
-    if Uniform(Key, umIgnore).Location < 0 then Continue;
+    if Uniform(Key, umIgnore).Location = GLUniformLocationNone then Continue;
     if (Field is TSFNode) or (Field is TMFNode) then
     begin
       if SharedUniformsTextures.IndexOf(Field) < 0 then SharedUniformsTextures.Add(Field);

@@ -98,12 +98,13 @@ type
 function TX3DRendererShape.SurfaceQueryBuffers(out Coordinates, Indices: TGLBuffer;
   out Stride, VertexCount, IndexCount: Cardinal): Boolean;
 begin
-  Coordinates := 0; Indices := 0; Stride := 0; VertexCount := 0; IndexCount := 0;
+  Coordinates := GLObjectNone; Indices := GLObjectNone;
+  Stride := 0; VertexCount := 0; IndexCount := 0;
   Result := (Cache <> nil) and (Cache.Arrays <> nil);
   if not Result then Exit;
   Result := Cache.VboCoordinatePreserveGeometryOrder and
     (Cache.Arrays.Primitive = gpTriangles) and Cache.Arrays.HasIndexes and
-    (Cache.Vbo[vtCoordinate] <> 0) and (Cache.Vbo[vtIndex] <> 0) and
+    (Cache.Vbo[vtCoordinate] <> GLObjectNone) and (Cache.Vbo[vtIndex] <> GLObjectNone) and
     (Cache.VboToReload = []);
   if not Result then Exit;
   Coordinates := Cache.Vbo[vtCoordinate]; Indices := Cache.Vbo[vtIndex];
@@ -114,8 +115,9 @@ end;
 function TX3DRendererShape.DeformedQueryBuffers(out Coordinates, Indices: TGLBuffer;
   out Stride, VertexCount, IndexCount: Cardinal; out Posed: Boolean): Boolean;
 begin
-  Coordinates:=0;Indices:=0;Stride:=0;VertexCount:=0;IndexCount:=0;Posed:=false;
-  Result:=(Cache<>nil) and (Cache.Arrays<>nil) and (Cache.Vbo[vtCoordinate]<>0) and
+  Coordinates:=GLObjectNone;Indices:=GLObjectNone;
+  Stride:=0;VertexCount:=0;IndexCount:=0;Posed:=false;
+  Result:=(Cache<>nil) and (Cache.Arrays<>nil) and (Cache.Vbo[vtCoordinate]<>GLObjectNone) and
     (Cache.Arrays.Primitive=gpTriangles) and (Cache.VboToReload=[]);
   if not Result then Exit;
   Posed:=Cache.PoseValid;
@@ -145,6 +147,13 @@ end;
 
 function TX3DRendererShape.PrepareSurfaceQueryBuffers(
   const RenderOptions: TCastleRenderOptions): Boolean;
+{$ifdef CASTLE_WEBGL}
+begin
+  { Native GPU terrain-query preparation requires buffer readback and numeric
+    GL names. Browser callers use the CPU geometry query path. }
+  Result := false;
+end;
+{$else}
 var
   Coordinates, Indices: TGLBuffer;
   Stride, VertexCount, IndexCount: Cardinal;
@@ -184,6 +193,7 @@ begin
   end;
   Result := SurfaceQueryBuffers(Coordinates, Indices, Stride, VertexCount, IndexCount);
 end;
+{$endif}
 
 { Sometimes the updates indicated by Shape.Cache.VboToReload can be performed without
   actually recreating the Shape.Cache.Arrays (so no need to create TArraysGenerator

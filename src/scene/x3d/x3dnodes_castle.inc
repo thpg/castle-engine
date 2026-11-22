@@ -519,7 +519,14 @@ var SharedEffectValueSerial: Int64 = 0;
 
 procedure TEffectNode.InternalSharedValuesChanged;
 begin
+  {$if defined(WASI) and not defined(FPC_WASM_THREADS)}
+  { The browser WASI preview-1 target is single-threaded. Its RTL has no
+    64-bit interlocked operations; retain the full serial without atomics. }
+  Inc(SharedEffectValueSerial);
+  InternalSharedValuesSerial := SharedEffectValueSerial;
+  {$else}
   InternalSharedValuesSerial := InterlockedIncrement64(SharedEffectValueSerial);
+  {$endif}
 end;
 
 constructor TEffectNode.Create(const AX3DName, ABaseUrl: String);

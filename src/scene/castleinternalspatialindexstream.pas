@@ -265,6 +265,11 @@ function QueueSpatialMesh(const Arrays:TGeometryArrays;Padding:Single):TSpatialM
 var Size:SizeUInt;I:Integer;
 begin
   Result:=nil;
+  {$if defined(WASI) and not defined(FPC_WASM_THREADS)}
+  { WebGL keeps the original index buffer. A worker queue cannot run on the
+    single-thread WASI host, and creating an OS event fails before startup. }
+  Exit;
+  {$endif}
   if (Arrays=nil) or Arrays.DataFreed or (Arrays.Indexes=nil) or
      (Arrays.Primitive<>gpTriangles) or (Arrays.Counts<>nil) or (Arrays.Indexes.Count mod 3<>0) then Exit;
   Size:=SizeUInt(Arrays.Count)*SizeOf(TVector3)+SizeUInt(Arrays.Indexes.Count)*SizeOf(TGeometryIndex);
@@ -304,9 +309,15 @@ begin
   for I:=0 to High(Workers) do if Workers[I]<>nil then begin Workers[I].WaitFor;Workers[I].Free end;
 end;
 initialization
-  InitCriticalSection(QueueLock);PendingJobs:=TList.Create;Wake:=TEvent.Create(nil,True,False,'');
+  InitCriticalSection(QueueLock);PendingJobs:=TList.Create;
+  {$if not defined(WASI) or defined(FPC_WASM_THREADS)}
+  Wake:=TEvent.Create(nil,True,False,'');
   UseSpatialIndexStreams:=GetEnvironmentVariable('REZVIVO_SPATIAL_INDICES')='1';
   UseSpatialIndirect:=GetEnvironmentVariable('REZVIVO_SPATIAL_INDIRECT')='1';
+  {$endif}
 finalization
-  StopWorkers;Wake.Free;PendingJobs.Free;DoneCriticalSection(QueueLock);
+  {$if not defined(WASI) or defined(FPC_WASM_THREADS)}
+  StopWorkers;
+  {$endif}
+  Wake.Free;PendingJobs.Free;DoneCriticalSection(QueueLock);
 end.

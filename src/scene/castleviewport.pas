@@ -3087,7 +3087,7 @@ procedure TCastleViewport.RenderWithoutScreenEffects;
     if (not FillsWholeContainer) and (not RenderScreenEffects) then
       { Use Scissor to limit what RenderContext.Clear clears. }
       RenderContext.ScissorEnable(
-        RenderRect.Translate(Vector2(RenderContext.ViewportDelta)).Round);
+        RenderRect.Round);
 
     RenderFromViewEverything(RenderingCamera);
 

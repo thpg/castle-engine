@@ -283,7 +283,7 @@ procedure TLightShader.SetDynamicUniforms(AProgram: TX3DShaderProgram);
       light's field in UniformsTextures leaves a dangling pointer when an
       avatar is replaced while another draw still uses this program. }
     if (Field.Value <> nil) and
-       (AProgram.Uniform(Field.X3DName, umIgnore).Location >= 0) then
+       (AProgram.Uniform(Field.X3DName, umIgnore).Location <> GLUniformLocationNone) then
       AProgram.SharedUniformsTextures.Add(Field);
   end;
 var
